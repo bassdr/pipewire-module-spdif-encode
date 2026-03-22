@@ -3,7 +3,9 @@ project(
     'cpp',
     version : '0.1.0',
     default_options : [
-        'cpp_std=c++17',
+        'cpp_std=c++23',
+        'cpp_eh=none',
+        'cpp_rtti=false',
         'warning_level=2',
     ],
     license : 'MIT',

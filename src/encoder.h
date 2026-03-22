@@ -1,10 +1,26 @@
 #pragma once
 
-#include <cstddef>
 #include <cstdint>
+#include <expected>
 
-// Encoder result from EncodeFrame
-struct EncodeResult
+enum class InitError : uint8_t
 {
-    int BytesWritten;  // -1 on error
+    CodecNotFound,
+    ContextAllocFailed,
+    ConfigQueryFailed,
+    CodecOpenFailed,
+    FrameAllocFailed,
+    FrameBufferAllocFailed,
+    PacketAllocFailed,
 };
+
+enum class EncodeError : uint8_t
+{
+    InsufficientSamples,
+    FrameAllocFailed,
+    SendFrameFailed,
+    ReceivePacketFailed,
+    OutputBufferTooSmall,
+};
+
+using EncodeResult = std::expected<uint32_t, EncodeError>;

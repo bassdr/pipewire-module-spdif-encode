@@ -12,50 +12,46 @@ TEST_CASE("AC3 encoder constants are correct", "[ac3]")
     CHECK(Ac3Encoder::DataType == 0x01);
 }
 
-TEST_CASE("AC3 encoder initializes successfully", "[ac3]")
+TEST_CASE("AC3 encoder creates successfully", "[ac3]")
 {
-    Ac3Encoder enc = {};
-
-    REQUIRE(enc.Init(6, 48000, 448000));
-    enc.Destroy();
+    auto enc = Ac3Encoder::Create(6, 48000, 448000);
+    REQUIRE(enc.has_value());
 }
 
 TEST_CASE("AC3 encoder rejects too few samples", "[ac3]")
 {
-    Ac3Encoder enc = {};
-    REQUIRE(enc.Init(6, 48000, 448000));
+    auto enc = Ac3Encoder::Create(6, 48000, 448000);
+    REQUIRE(enc.has_value());
 
     uint8_t outputBuf[6144];
     std::vector<int16_t> samples(100 * 6, 0);
 
-    int result = enc.EncodeFrame(samples.data(), 100, outputBuf, sizeof(outputBuf));
-    CHECK(result == -1);
-
-    enc.Destroy();
+    auto result = enc->EncodeFrame(samples.data(), 100, outputBuf, sizeof(outputBuf));
+    CHECK(!result.has_value());
+    CHECK(result.error() == EncodeError::InsufficientSamples);
 }
 
 TEST_CASE("AC3 encoder produces valid output from silence", "[ac3]")
 {
-    Ac3Encoder enc = {};
-    REQUIRE(enc.Init(6, 48000, 448000));
+    auto enc = Ac3Encoder::Create(6, 48000, 448000);
+    REQUIRE(enc.has_value());
 
     // 1536 samples * 6 channels of silence
     std::vector<int16_t> samples(Ac3Encoder::FrameSize * 6, 0);
     uint8_t outputBuf[6144];
 
-    int result = enc.EncodeFrame(samples.data(), Ac3Encoder::FrameSize,
-                                 outputBuf, sizeof(outputBuf));
+    auto result = enc->EncodeFrame(samples.data(), Ac3Encoder::FrameSize,
+                                   outputBuf, sizeof(outputBuf));
 
-    REQUIRE(result > 0);
-    CHECK(result <= Ac3Encoder::BurstSize);
-
-    enc.Destroy();
+    REQUIRE(result.has_value());
+    CHECK(*result > 0);
+    CHECK(*result <= Ac3Encoder::BurstSize);
 }
 
 TEST_CASE("AC3 encoder produces output from non-silent input", "[ac3]")
 {
-    Ac3Encoder enc = {};
-    REQUIRE(enc.Init(6, 48000, 448000));
+    auto enc = Ac3Encoder::Create(6, 48000, 448000);
+    REQUIRE(enc.has_value());
 
     std::vector<int16_t> samples(Ac3Encoder::FrameSize * 6);
     // Generate a simple sine-ish pattern
@@ -65,48 +61,43 @@ TEST_CASE("AC3 encoder produces output from non-silent input", "[ac3]")
     }
 
     uint8_t outputBuf[6144];
-    int result = enc.EncodeFrame(samples.data(), Ac3Encoder::FrameSize,
-                                 outputBuf, sizeof(outputBuf));
+    auto result = enc->EncodeFrame(samples.data(), Ac3Encoder::FrameSize,
+                                   outputBuf, sizeof(outputBuf));
 
-    REQUIRE(result > 0);
-    CHECK(result <= Ac3Encoder::BurstSize);
-
-    enc.Destroy();
+    REQUIRE(result.has_value());
+    CHECK(*result > 0);
+    CHECK(*result <= Ac3Encoder::BurstSize);
 }
 
 TEST_CASE("AC3 encoder can encode multiple consecutive frames", "[ac3]")
 {
-    Ac3Encoder enc = {};
-    REQUIRE(enc.Init(6, 48000, 448000));
+    auto enc = Ac3Encoder::Create(6, 48000, 448000);
+    REQUIRE(enc.has_value());
 
     std::vector<int16_t> samples(Ac3Encoder::FrameSize * 6, 1000);
     uint8_t outputBuf[6144];
 
     for (int frame = 0; frame < 10; frame++)
     {
-        int result = enc.EncodeFrame(samples.data(), Ac3Encoder::FrameSize,
-                                     outputBuf, sizeof(outputBuf));
+        auto result = enc->EncodeFrame(samples.data(), Ac3Encoder::FrameSize,
+                                       outputBuf, sizeof(outputBuf));
         INFO("frame: " << frame);
-        REQUIRE(result > 0);
+        REQUIRE(result.has_value());
     }
-
-    enc.Destroy();
 }
 
 TEST_CASE("AC3 encoded output fits in IEC 61937 burst", "[ac3]")
 {
-    Ac3Encoder enc = {};
-    REQUIRE(enc.Init(6, 48000, 448000));
+    auto enc = Ac3Encoder::Create(6, 48000, 448000);
+    REQUIRE(enc.has_value());
 
     std::vector<int16_t> samples(Ac3Encoder::FrameSize * 6, 16000);
     uint8_t outputBuf[6144];
 
-    int result = enc.EncodeFrame(samples.data(), Ac3Encoder::FrameSize,
-                                 outputBuf, sizeof(outputBuf));
+    auto result = enc->EncodeFrame(samples.data(), Ac3Encoder::FrameSize,
+                                   outputBuf, sizeof(outputBuf));
 
-    REQUIRE(result > 0);
+    REQUIRE(result.has_value());
     // Must fit in burst with 8-byte IEC 61937 header
-    CHECK(result + 8 <= Ac3Encoder::BurstSize);
-
-    enc.Destroy();
+    CHECK(*result + 8 <= Ac3Encoder::BurstSize);
 }

@@ -10,6 +10,8 @@ charset = utf-8
 indent_style = space
 indent_size = 4
 max_line_length = 120
+# East const: `A const*`, `A const&`, `A const`
+# Pointer/ref on the left: `A*`, `A&`, `A const*`
 
 [*.{conf,json}]
 indent_style = space
