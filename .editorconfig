@@ -1,0 +1,24 @@
+root = true
+
+[*]
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+charset = utf-8
+
+[*.{cpp,h,hpp}]
+indent_style = space
+indent_size = 4
+max_line_length = 120
+
+[*.{conf,json}]
+indent_style = space
+indent_size = 4
+
+[meson.build]
+indent_style = space
+indent_size = 4
+
+[meson_options.txt]
+indent_style = space
+indent_size = 4

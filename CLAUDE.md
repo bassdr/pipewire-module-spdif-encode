@@ -84,9 +84,12 @@ pipewire-module-spdif-encode/
 ├── src/
 │   ├── module-spdif-encode.cpp        # PipeWire module entry point, stream setup, processing
 │   ├── encoder.h                      # Codec-agnostic encoder interface
+│   ├── encoder-ac3.h                  # AC3 encoder header
 │   ├── encoder-ac3.cpp                # AC3 encoder (libavcodec ac3_fixed/ac3)
-│   ├── encoder-dts.cpp                # DTS encoder (libavcodec dca / libdcaenc)
 │   └── iec61937.h                     # IEC 61937 framing (header-only, small enough)
+├── tests/
+│   ├── test-iec61937.cpp              # IEC 61937 framing tests (Catch2)
+│   └── test-encoder-ac3.cpp           # AC3 encoder tests (Catch2)
 └── config/
     └── spdif-encode.conf              # Example PipeWire config to load the module
 ```
@@ -98,15 +101,15 @@ pipewire-module-spdif-encode/
 1. **`meson.build`** — build system linking against `libpipewire-0.3` and `libavcodec`/`libavutil`
 2. **`src/iec61937.h`** — IEC 61937 framing functions (header-only)
 3. **`src/encoder.h`** — encoder interface struct (init, encode_frame, destroy, frame_size, burst_size)
-4. **`src/encoder-ac3.c`** — AC3 implementation using libavcodec
-5. **`src/module-spdif-encode.c`** — PipeWire module with dual-stream pattern
+4. **`src/encoder-ac3.cpp`** — AC3 implementation using libavcodec
+5. **`src/module-spdif-encode.cpp`** — PipeWire module with dual-stream pattern
 6. **`config/spdif-encode.conf`** — working config file
 
 Goal: select the virtual sink in pavucontrol, hear 5.1 audio encoded through S/PDIF.
 
 ### Phase 2: DTS support
 
-7. **`src/encoder-dts.c`** — DTS encoder (libavcodec or libdcaenc)
+7. **`src/encoder-dts.cpp`** — DTS encoder (libavcodec or libdcaenc)
 8. **`meson_options.txt`** — options for enabling/disabling codecs
 9. Module arg `codec=ac3|dts` to select at load time (or auto-detect from hardware caps)
 
@@ -117,6 +120,13 @@ Goal: select the virtual sink in pavucontrol, hear 5.1 audio encoded through S/P
 12. Proper latency reporting to PipeWire
 13. Distribution packaging
 14. Handle device hot-plug (S/PDIF cable connect/disconnect)
+
+## Coding Style
+
+- C++, 4 spaces indentation, Allman brace style
+- 120 character line length, LF line endings
+- No trailing whitespace, single final newline
+- See `.editorconfig` for editor integration
 
 ## Build & Test Commands
 
