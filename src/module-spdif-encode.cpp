@@ -181,12 +181,32 @@ static void OnPlaybackProcess(void* userData)
 
 static pw_stream_events const CaptureStreamEvents = {
     .version = PW_VERSION_STREAM_EVENTS,
+    .destroy = {},
+    .state_changed = {},
+    .control_info = {},
+    .io_changed = {},
+    .param_changed = {},
+    .add_buffer = {},
+    .remove_buffer = {},
     .process = OnCaptureProcess,
+    .drained = {},
+    .command = {},
+    .trigger_done = {},
 };
 
 static pw_stream_events const PlaybackStreamEvents = {
     .version = PW_VERSION_STREAM_EVENTS,
+    .destroy = {},
+    .state_changed = {},
+    .control_info = {},
+    .io_changed = {},
+    .param_changed = {},
+    .add_buffer = {},
+    .remove_buffer = {},
     .process = OnPlaybackProcess,
+    .drained = {},
+    .command = {},
+    .trigger_done = {},
 };
 
 static void ModuleDestroy(void* userData)
@@ -200,10 +220,13 @@ static void ModuleDestroy(void* userData)
 static pw_impl_module_events const ModuleEvents = {
     .version = PW_VERSION_IMPL_MODULE_EVENTS,
     .destroy = ModuleDestroy,
+    .free = {},
+    .initialized = {},
+    .registered = {},
 };
 
 extern "C" SPA_EXPORT
-int pipewire__module_init(pw_impl_module* module, char const* args)
+int pipewire__module_init(pw_impl_module* module, char const* /*args*/)
 {
     auto* data = new ModuleData();
     data->m_Module = module;
