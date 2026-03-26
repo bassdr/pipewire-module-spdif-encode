@@ -31,7 +31,7 @@ shared_library(
     dependencies : [pipewire_dep, libavcodec_dep, libavutil_dep],
     install : true,
     install_dir : pipewire_moduledir,
-    name_prefix : '',
+    name_prefix : 'lib',
 )
 
 if get_option('tests')
