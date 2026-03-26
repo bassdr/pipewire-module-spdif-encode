@@ -42,17 +42,18 @@ TEST_CASE("IEC 61937 Pd field is payload length in bits", "[iec61937]")
     CHECK(out16[3] == 128 * 8);
 }
 
-TEST_CASE("IEC 61937 payload is copied after header", "[iec61937]")
+TEST_CASE("IEC 61937 payload is byte-swapped (16-bit words) after header", "[iec61937]")
 {
     uint8_t encoded[4] = {0xDE, 0xAD, 0xBE, 0xEF};
     uint8_t burst[6144];
 
     REQUIRE(Iec61937::CreateBurst(encoded, 4, 0x01, 6144, burst).has_value());
 
-    CHECK(burst[8] == 0xDE);
-    CHECK(burst[9] == 0xAD);
-    CHECK(burst[10] == 0xBE);
-    CHECK(burst[11] == 0xEF);
+    // Each pair of bytes is swapped for IEC 61937 big-endian word order
+    CHECK(burst[8] == 0xAD);
+    CHECK(burst[9] == 0xDE);
+    CHECK(burst[10] == 0xEF);
+    CHECK(burst[11] == 0xBE);
 }
 
 TEST_CASE("IEC 61937 burst is zero-padded after payload", "[iec61937]")

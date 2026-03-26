@@ -8,18 +8,30 @@
 
 The only existing solution for real-time surround encoding on Linux is the [ALSA a52 plugin](https://github.com/alsa-project/alsa-plugins). Under PipeWire, this plugin is accessed through multiple abstraction layers (PipeWire → PulseAudio compat → ALSA compat → a52 plugin → hardware), causing latency, buffer glitches, and audible artifacts (scratching sounds at stream start). This module replaces all of that with a single native PipeWire module that talks directly to the hardware sink.
 
+### Target use case
+
+A user has an HDMI or S/PDIF output connected to an AVR/soundbar that expects encoded surround audio. They want any application playing surround audio to be transparently AC3-encoded before reaching the hardware. The audio routing is:
+
+```
+Application (5.1 PCM) ──> Virtual Sink ("S/PDIF Surround Encoder") ──> AC3 encode ──> HDMI/S/PDIF device
+```
+
+The user sets `target.object` in the module config to their HDMI/S/PDIF device name, then selects the virtual sink as their default output (via pavucontrol or `wpctl set-default`). All audio routed to the virtual sink is encoded on the fly.
+
+Ideally this would be a device profile in pavucontrol's Configuration tab (like "Surround 5.1 AC3 Encoded (HDMI)"), but that requires a SPA device/profile plugin which is significantly more complex. The current approach uses the dual-stream module pattern (from PipeWire's module-loopback), which is the standard way for out-of-tree PipeWire modules.
+
 ### How it works
 
 ```
 ┌─────────────┐     ┌──────────────────────────┐     ┌─────────────────┐
-│ Applications │────>│ pipewire-module-spdif-    │────>│ ALSA IEC958     │
-│ (5.1 PCM)   │     │ encode                    │     │ device (hw:X,Y) │
+│ Applications │────>│ pipewire-module-spdif-    │────>│ HDMI / S/PDIF   │
+│ (5.1 PCM)   │     │ encode                    │     │ output device   │
 │              │     │                           │     │                 │
-│ Visible in   │     │ 1. Receives 5.1 F32P PCM  │     │ S/PDIF, TOSLINK,│
-│ pavucontrol  │     │ 2. Buffers 1536 samples   │     │ or HDMI output  │
-│ as a normal  │     │ 3. Encodes AC3 or DTS     │     │                 │
-│ audio sink   │     │ 4. IEC 61937 framing      │     │                 │
-│              │     │ 5. Outputs stereo S16LE   │     │                 │
+│ Route to the │     │ 1. Receives 5.1 F32P PCM  │     │ Set via         │
+│ virtual sink │     │ 2. Buffers 1536 samples   │     │ target.object   │
+│ "S/PDIF      │     │ 3. Encodes AC3 or DTS     │     │ module arg      │
+│  Surround    │     │ 4. IEC 61937 framing      │     │                 │
+│  Encoder"    │     │ 5. Outputs stereo S16LE   │     │                 │
 └─────────────┘     └──────────────────────────┘     └─────────────────┘
 ```
 
@@ -34,9 +46,10 @@ The module creates two `pw_stream` objects:
    - Accepts multichannel PCM (5.1 float32 planar)
    - Any application can route audio to it
 
-2. **Playback stream** (`PW_DIRECTION_OUTPUT`)
+2. **Playback stream** (`PW_DIRECTION_OUTPUT`, `media.class = "Stream/Output/Audio"`)
    - Outputs stereo S16LE containing IEC 61937-wrapped encoded data
-   - Connects to the real hardware S/PDIF/HDMI device
+   - Connects to the hardware device specified by `target.object` module arg
+   - Marked `node.passive` and `node.dont-reconnect` to avoid appearing as a regular playback client
    - Uses `PW_STREAM_FLAG_TRIGGER` — only processes when capture triggers it
 
 ### Encoding pipeline

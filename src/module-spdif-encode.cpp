@@ -15,6 +15,9 @@ extern "C"
 #include <pipewire/pipewire.h>
 #include <pipewire/impl-module.h>
 #include <spa/param/audio/format-utils.h>
+#include <spa/param/props.h>
+#include <spa/pod/builder.h>
+#include <spa/pod/iter.h>
 }
 
 static constexpr int InputChannels = 6;
@@ -52,6 +55,16 @@ struct ModuleData
     // Encoding workspace
     std::array<uint8_t, Ac3Encoder::BurstSize> m_EncodeBuf{};
     std::array<uint8_t, Ac3Encoder::BurstSize> m_BurstBuf{};
+
+    // Output ring buffer: stores IEC 61937 bursts as S16LE stereo samples.
+    // Each AC3 burst is 1536 stereo frames (6144 bytes).  Ring holds 4 bursts.
+    static constexpr size_t BurstFrames = Ac3Encoder::BurstSize / (sizeof(int16_t) * OutputChannels);
+    static constexpr size_t OutRingFrames = BurstFrames * 4;
+    static constexpr size_t OutRingSamples = OutRingFrames * OutputChannels;
+    std::array<int16_t, OutRingSamples> m_OutRingBuf{};
+    size_t m_OutRingWritePos{};
+    size_t m_OutRingReadPos{};
+    size_t m_OutRingStored{};  // in stereo frames
 };
 
 [[gnu::always_inline]] static inline void ConvertF32PlanarToS16Interleaved(
@@ -109,20 +122,65 @@ static void OnCaptureProcess(void* userData)
 
     pw_stream_queue_buffer(data->m_CaptureStream.get(), buf);
 
-    if (data->m_RingSamplesStored >= static_cast<size_t>(Ac3Encoder::FrameSize))
+    // Encode as many AC3 frames as we have input for, push bursts to output ring
+    while (data->m_RingSamplesStored >= static_cast<size_t>(Ac3Encoder::FrameSize))
     {
-        pw_stream_trigger_process(data->m_PlaybackStream.get());
+        // Read one frame from input ring
+        static constexpr size_t InterleavedFrameSize = Ac3Encoder::FrameSize * InputChannels;
+        std::array<int16_t, InterleavedFrameSize> frame{};
+        size_t readPos = (data->m_RingWritePos + ModuleData::RingBufSize
+                          - data->m_RingSamplesStored * InputChannels) % ModuleData::RingBufSize;
+
+        for (int16_t& sample : frame)
+        {
+            sample = data->m_RingBuf[readPos];
+            readPos = (readPos + 1) % ModuleData::RingBufSize;
+        }
+        data->m_RingSamplesStored -= Ac3Encoder::FrameSize;
+
+        // Encode AC3
+        auto encodeResult = data->m_Enc->EncodeFrame(frame.data(), Ac3Encoder::FrameSize,
+                                                     data->m_EncodeBuf.data(),
+                                                     data->m_EncodeBuf.size());
+        if (!encodeResult)
+        {
+            continue;
+        }
+
+        // IEC 61937 framing
+        auto burstResult = Iec61937::CreateBurst(data->m_EncodeBuf.data(), *encodeResult,
+                                                  Ac3Encoder::DataType, Ac3Encoder::BurstSize,
+                                                  data->m_BurstBuf.data());
+        if (!burstResult)
+        {
+            continue;
+        }
+
+        // Push burst to output ring (as S16LE stereo samples)
+        if (data->m_OutRingStored + ModuleData::BurstFrames > ModuleData::OutRingFrames)
+        {
+            // Output ring full — drop oldest burst to avoid blocking
+            data->m_OutRingReadPos = (data->m_OutRingReadPos + ModuleData::BurstFrames * OutputChannels)
+                                     % ModuleData::OutRingSamples;
+            data->m_OutRingStored -= ModuleData::BurstFrames;
+        }
+
+        auto const* burstSamples = reinterpret_cast<int16_t const*>(data->m_BurstBuf.data());
+        for (size_t i = 0; i < ModuleData::BurstFrames * OutputChannels; ++i)
+        {
+            data->m_OutRingBuf[data->m_OutRingWritePos] = burstSamples[i];
+            data->m_OutRingWritePos = (data->m_OutRingWritePos + 1) % ModuleData::OutRingSamples;
+        }
+        data->m_OutRingStored += ModuleData::BurstFrames;
     }
+
+    // Always trigger playback to drain the output ring
+    pw_stream_trigger_process(data->m_PlaybackStream.get());
 }
 
 static void OnPlaybackProcess(void* userData)
 {
     auto* data = static_cast<ModuleData*>(userData);
-
-    if (data->m_RingSamplesStored < static_cast<size_t>(Ac3Encoder::FrameSize))
-    {
-        return;
-    }
 
     auto queueBack = [&](pw_buffer* b) { pw_stream_queue_buffer(data->m_PlaybackStream.get(), b); };
     auto buf = std::unique_ptr<pw_buffer, decltype(queueBack)>(
@@ -132,50 +190,105 @@ static void OnPlaybackProcess(void* userData)
         return;
     }
 
-    // Read one frame from ring buffer
-    static constexpr size_t InterleavedFrameSize = Ac3Encoder::FrameSize * InputChannels;
-    std::array<int16_t, InterleavedFrameSize> frame{};
-    size_t readPos = (data->m_RingWritePos + ModuleData::RingBufSize
-                      - data->m_RingSamplesStored * InputChannels) % ModuleData::RingBufSize;
-
-    for (int16_t& sample : frame)
-    {
-        sample = data->m_RingBuf[readPos];
-        readPos = (readPos + 1) % ModuleData::RingBufSize;
-    }
-    data->m_RingSamplesStored -= Ac3Encoder::FrameSize;
-
-    // Encode
-    auto encodeResult = data->m_Enc->EncodeFrame(frame.data(), Ac3Encoder::FrameSize,
-                                                 data->m_EncodeBuf.data(),
-                                                 data->m_EncodeBuf.size());
-    if (!encodeResult)
-    {
-        return;
-    }
-
-    // IEC 61937 framing
-    auto burstResult = Iec61937::CreateBurst(data->m_EncodeBuf.data(), *encodeResult,
-                                              Ac3Encoder::DataType, Ac3Encoder::BurstSize,
-                                              data->m_BurstBuf.data());
-    if (!burstResult)
-    {
-        return;
-    }
-
-    // Write burst to output
     spa_buffer* spaBuf = buf->buffer;
-    if (spaBuf->datas[0].data)
+    if (!spaBuf->datas[0].data)
     {
-        uint32_t outputBytes = Ac3Encoder::BurstSize;
-        if (outputBytes > spaBuf->datas[0].maxsize)
+        return;
+    }
+
+    // Determine how many stereo frames the output buffer can hold
+    uint32_t const maxFrames = spaBuf->datas[0].maxsize / (sizeof(int16_t) * OutputChannels);
+
+    // Use buf->requested if available (= quantum), else fill the buffer
+    uint32_t outFrames = buf->requested ? static_cast<uint32_t>(buf->requested) : maxFrames;
+    if (outFrames > maxFrames)
+    {
+        outFrames = maxFrames;
+    }
+
+    auto* dst = static_cast<int16_t*>(spaBuf->datas[0].data);
+
+    // Drain output ring into the PipeWire buffer
+    uint32_t const ringFrames = std::min(outFrames, static_cast<uint32_t>(data->m_OutRingStored));
+    for (uint32_t i = 0; i < ringFrames * OutputChannels; ++i)
+    {
+        dst[i] = data->m_OutRingBuf[data->m_OutRingReadPos];
+        data->m_OutRingReadPos = (data->m_OutRingReadPos + 1) % ModuleData::OutRingSamples;
+    }
+    data->m_OutRingStored -= ringFrames;
+
+    // Zero-fill remainder (IEC 61937 silence = zeros)
+    std::memset(dst + ringFrames * OutputChannels, 0,
+                (outFrames - ringFrames) * sizeof(int16_t) * OutputChannels);
+
+    spaBuf->datas[0].chunk->offset = 0;
+    spaBuf->datas[0].chunk->size = outFrames * sizeof(int16_t) * OutputChannels;
+    spaBuf->datas[0].chunk->stride = sizeof(int16_t) * OutputChannels;
+}
+
+static void ForceUnitVolume(pw_stream* stream)
+{
+    float const volumes[OutputChannels] = {1.0f, 1.0f};
+
+    uint8_t buf[1024];
+    spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
+    spa_pod_frame f;
+
+    spa_pod_builder_push_object(&b, &f, SPA_TYPE_OBJECT_Props, SPA_PARAM_Props);
+    spa_pod_builder_prop(&b, SPA_PROP_channelVolumes, 0);
+    spa_pod_builder_array(&b, sizeof(float), SPA_TYPE_Float, OutputChannels, volumes);
+    spa_pod_builder_prop(&b, SPA_PROP_softVolumes, 0);
+    spa_pod_builder_array(&b, sizeof(float), SPA_TYPE_Float, OutputChannels, volumes);
+    spa_pod_builder_prop(&b, SPA_PROP_mute, 0);
+    spa_pod_builder_bool(&b, false);
+    auto* param = static_cast<spa_pod*>(spa_pod_builder_pop(&b, &f));
+
+    pw_stream_set_param(stream, SPA_PARAM_Props, param);
+}
+
+static void OnPlaybackParamChanged(void* userData, uint32_t id, spa_pod const* param)
+{
+    if (id != SPA_PARAM_Props || !param)
+    {
+        return;
+    }
+
+    auto* data = static_cast<ModuleData*>(userData);
+    bool needsReset = false;
+    auto const* obj = reinterpret_cast<spa_pod_object const*>(param);
+    spa_pod_prop const* prop;
+
+    SPA_POD_OBJECT_FOREACH(obj, prop)
+    {
+        if (prop->key == SPA_PROP_channelVolumes || prop->key == SPA_PROP_softVolumes)
         {
-            outputBytes = spaBuf->datas[0].maxsize;
+            float vols[SPA_AUDIO_MAX_CHANNELS];
+            uint32_t n = spa_pod_copy_array(&prop->value, SPA_TYPE_Float, vols, SPA_AUDIO_MAX_CHANNELS);
+            for (uint32_t i = 0; i < n; ++i)
+            {
+                if (vols[i] != 1.0f)
+                {
+                    needsReset = true;
+                    break;
+                }
+            }
         }
-        std::memcpy(spaBuf->datas[0].data, data->m_BurstBuf.data(), outputBytes);
-        spaBuf->datas[0].chunk->offset = 0;
-        spaBuf->datas[0].chunk->size = outputBytes;
-        spaBuf->datas[0].chunk->stride = sizeof(int16_t) * OutputChannels;
+        else if (prop->key == SPA_PROP_mute)
+        {
+            bool muted = false;
+            spa_pod_get_bool(&prop->value, &muted);
+            if (muted)
+            {
+                needsReset = true;
+            }
+        }
+    }
+
+    if (needsReset)
+    {
+        pw_log_warn("spdif-encode: volume/mute changed on output stream, "
+                    "resetting to 1.0 (encoded bitstream cannot be volume-adjusted)");
+        ForceUnitVolume(data->m_PlaybackStream.get());
     }
 }
 
@@ -200,7 +313,7 @@ static pw_stream_events const PlaybackStreamEvents = {
     .state_changed = {},
     .control_info = {},
     .io_changed = {},
-    .param_changed = {},
+    .param_changed = OnPlaybackParamChanged,
     .add_buffer = {},
     .remove_buffer = {},
     .process = OnPlaybackProcess,
@@ -226,8 +339,9 @@ static pw_impl_module_events const ModuleEvents = {
 };
 
 extern "C" SPA_EXPORT
-int pipewire__module_init(pw_impl_module* module, char const* /*args*/)
+int pipewire__module_init(pw_impl_module* module, char const* args)
 {
+    auto* moduleProps = args ? pw_properties_new_string(args) : pw_properties_new(nullptr, nullptr);
     auto* data = new ModuleData();
     data->m_Module = module;
     data->m_Context = pw_impl_module_get_context(module);
@@ -236,6 +350,7 @@ int pipewire__module_init(pw_impl_module* module, char const* /*args*/)
     if (!enc)
     {
         pw_log_error("spdif-encode: failed to initialize AC3 encoder");
+        pw_properties_free(moduleProps);
         delete data;
         return -1;
     }
@@ -287,12 +402,27 @@ int pipewire__module_init(pw_impl_module* module, char const* /*args*/)
                       captureParams, 1);
 
     // Playback stream: stereo S16LE to hardware
+    // The output is IEC 61937-framed AC3 data disguised as plain stereo PCM.
+    // We must prevent audioconvert from modifying the bitstream.
     auto* playbackProps = pw_properties_new(
         PW_KEY_NODE_NAME, "spdif-encode-output",
         PW_KEY_MEDIA_TYPE, "Audio",
         PW_KEY_MEDIA_CATEGORY, "Playback",
+        PW_KEY_MEDIA_CLASS, "Stream/Output/Audio",
+        PW_KEY_NODE_DONT_RECONNECT, "true",
+        PW_KEY_NODE_LATENCY, "1536/48000",
+        PW_KEY_NODE_RATE, "1/48000",
+        "stream.dont-remix", "true",
+        "channelmix.disable", "true",
+        "dither.noise", "0",
         nullptr
     );
+
+    char const* target = pw_properties_get(moduleProps, "target.object");
+    if (target && target[0])
+    {
+        pw_properties_set(playbackProps, PW_KEY_TARGET_OBJECT, target);
+    }
 
     data->m_PlaybackStream.reset(pw_stream_new_simple(
         pw_context_get_main_loop(data->m_Context),
@@ -305,15 +435,15 @@ int pipewire__module_init(pw_impl_module* module, char const* /*args*/)
     uint8_t playbackParamBuf[1024];
     spa_pod_builder playbackBuilder = SPA_POD_BUILDER_INIT(playbackParamBuf, sizeof(playbackParamBuf));
 
-    spa_audio_info_raw playbackInfo{};
-    playbackInfo.format = SPA_AUDIO_FORMAT_S16_LE;
-    playbackInfo.rate = SampleRate;
-    playbackInfo.channels = OutputChannels;
-    playbackInfo.position[0] = SPA_AUDIO_CHANNEL_FL;
-    playbackInfo.position[1] = SPA_AUDIO_CHANNEL_FR;
+    spa_audio_info_raw playbackRawInfo{};
+    playbackRawInfo.format = SPA_AUDIO_FORMAT_S16_LE;
+    playbackRawInfo.rate = SampleRate;
+    playbackRawInfo.channels = OutputChannels;
+    playbackRawInfo.position[0] = SPA_AUDIO_CHANNEL_FL;
+    playbackRawInfo.position[1] = SPA_AUDIO_CHANNEL_FR;
 
     spa_pod const* playbackParams[1];
-    playbackParams[0] = spa_format_audio_raw_build(&playbackBuilder, SPA_PARAM_EnumFormat, &playbackInfo);
+    playbackParams[0] = spa_format_audio_raw_build(&playbackBuilder, SPA_PARAM_EnumFormat, &playbackRawInfo);
 
     pw_stream_connect(data->m_PlaybackStream.get(),
                       PW_DIRECTION_OUTPUT,
@@ -323,6 +453,11 @@ int pipewire__module_init(pw_impl_module* module, char const* /*args*/)
                                                    PW_STREAM_FLAG_RT_PROCESS |
                                                    PW_STREAM_FLAG_TRIGGER),
                       playbackParams, 1);
+
+    // Lock playback stream volume to 1.0 — any scaling corrupts the IEC 61937 bitstream
+    ForceUnitVolume(data->m_PlaybackStream.get());
+
+    pw_properties_free(moduleProps);
 
     pw_log_info("spdif-encode: module loaded, AC3 encoder ready");
 
