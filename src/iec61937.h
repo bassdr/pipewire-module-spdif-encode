@@ -1,14 +1,25 @@
 #pragma once
 
+#include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <expected>
+#include <span>
 
 namespace Iec61937
 {
 
 static constexpr uint16_t SyncWord1 = 0xF872;
 static constexpr uint16_t SyncWord2 = 0x4E1F;
+
+struct BurstHeader
+{
+    uint16_t Pa = SyncWord1;
+    uint16_t Pb = SyncWord2;
+    uint16_t Pc;
+    uint16_t Pd;
+};
 
 enum class BurstError : uint8_t
 {
@@ -17,37 +28,43 @@ enum class BurstError : uint8_t
 
 using BurstResult = std::expected<uint32_t, BurstError>;
 
-inline BurstResult CreateBurst(uint8_t const* encodedFrame, uint32_t encodedSize,
-                               uint16_t dataType, uint32_t burstSize,
-                               uint8_t* outputBuf)
+inline BurstResult CreateBurst(std::span<uint8_t const> encodedFrame,
+                               uint16_t dataType, std::span<uint8_t> outputBuf)
 {
-    if (encodedSize + 8 > burstSize)
+    uint32_t const encodedSize = static_cast<uint32_t>(encodedFrame.size());
+    uint32_t const burstSize = static_cast<uint32_t>(outputBuf.size());
+
+    if (encodedSize + sizeof(BurstHeader) > burstSize)
     {
         return std::unexpected(BurstError::PayloadTooLarge);
     }
 
-    std::memset(outputBuf, 0, burstSize);
+    std::ranges::fill(outputBuf, uint8_t{0});
 
-    auto* out16 = reinterpret_cast<uint16_t*>(outputBuf);
-    out16[0] = SyncWord1;  // Pa
-    out16[1] = SyncWord2;  // Pb
-    out16[2] = dataType;   // Pc
-    out16[3] = static_cast<uint16_t>(encodedSize * 8);  // Pd: length in bits
+    BurstHeader const header
+    {
+        .Pc = dataType,
+        .Pd = static_cast<uint16_t>(encodedSize * 8),
+    };
+    std::memcpy(outputBuf.data(), &header, sizeof(header));
 
     // Byte-swap the payload: IEC 61937 transmits each 16-bit word in
     // big-endian order, so on little-endian systems every pair of bytes
     // must be swapped (same as ALSA a52 plugin's swab() and FFmpeg's
     // ff_spdif_bswap_buf16).
-    auto* dst = outputBuf + 8;
-    uint32_t i = 0;
-    for (; i + 1 < encodedSize; i += 2)
+    auto payload = std::span(reinterpret_cast<uint16_t*>(outputBuf.data() + sizeof(header)),
+                             encodedSize / 2);
+    auto source = std::span(reinterpret_cast<uint16_t const*>(encodedFrame.data()),
+                            encodedSize / 2);
+
+    std::ranges::transform(source, payload.begin(), std::byteswap<uint16_t>);
+
+    // Odd trailing byte: pair with zero and swap
+    if (encodedSize & 1)
     {
-        dst[i]     = encodedFrame[i + 1];
-        dst[i + 1] = encodedFrame[i];
-    }
-    if (i < encodedSize)
-    {
-        dst[i] = 0;
+        auto* tail = outputBuf.data() + sizeof(header) + encodedSize - 1;
+        tail[0] = 0;
+        tail[1] = encodedFrame[encodedSize - 1];
     }
 
     return burstSize;

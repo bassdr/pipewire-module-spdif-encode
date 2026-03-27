@@ -7,7 +7,7 @@ TEST_CASE("IEC 61937 burst has correct sync words", "[iec61937]")
     uint8_t encoded[64] = {0xAA};
     uint8_t burst[6144];
 
-    auto result = Iec61937::CreateBurst(encoded, 64, 0x01, 6144, burst);
+    auto result = Iec61937::CreateBurst(encoded, 0x01, burst);
 
     REQUIRE(result.has_value());
     CHECK(*result == 6144);
@@ -22,12 +22,13 @@ TEST_CASE("IEC 61937 Pc field contains data type", "[iec61937]")
     uint8_t encoded[64]{};
     uint8_t burst[6144];
 
-    REQUIRE(Iec61937::CreateBurst(encoded, 64, 0x01, 6144, burst).has_value());
+    REQUIRE(Iec61937::CreateBurst(encoded, 0x01, burst).has_value());
     auto* out16 = reinterpret_cast<uint16_t*>(burst);
     CHECK(out16[2] == 0x01);  // AC3 data type
 
-    REQUIRE(Iec61937::CreateBurst(encoded, 64, 0x0B, 2048, burst).has_value());
-    out16 = reinterpret_cast<uint16_t*>(burst);
+    uint8_t burst2[2048];
+    REQUIRE(Iec61937::CreateBurst(encoded, 0x0B, burst2).has_value());
+    out16 = reinterpret_cast<uint16_t*>(burst2);
     CHECK(out16[2] == 0x0B);  // DTS data type
 }
 
@@ -36,7 +37,7 @@ TEST_CASE("IEC 61937 Pd field is payload length in bits", "[iec61937]")
     uint8_t encoded[128]{};
     uint8_t burst[6144];
 
-    REQUIRE(Iec61937::CreateBurst(encoded, 128, 0x01, 6144, burst).has_value());
+    REQUIRE(Iec61937::CreateBurst(encoded, 0x01, burst).has_value());
 
     auto* out16 = reinterpret_cast<uint16_t*>(burst);
     CHECK(out16[3] == 128 * 8);
@@ -47,7 +48,7 @@ TEST_CASE("IEC 61937 payload is byte-swapped (16-bit words) after header", "[iec
     uint8_t encoded[4] = {0xDE, 0xAD, 0xBE, 0xEF};
     uint8_t burst[6144];
 
-    REQUIRE(Iec61937::CreateBurst(encoded, 4, 0x01, 6144, burst).has_value());
+    REQUIRE(Iec61937::CreateBurst(encoded, 0x01, burst).has_value());
 
     // Each pair of bytes is swapped for IEC 61937 big-endian word order
     CHECK(burst[8] == 0xAD);
@@ -65,7 +66,7 @@ TEST_CASE("IEC 61937 burst is zero-padded after payload", "[iec61937]")
     }
 
     uint8_t burst[6144];
-    REQUIRE(Iec61937::CreateBurst(encoded, 16, 0x01, 6144, burst).has_value());
+    REQUIRE(Iec61937::CreateBurst(encoded, 0x01, burst).has_value());
 
     // After header (8 bytes) + payload (16 bytes) = byte 24 onwards should be zero
     for (int i = 24; i < 6144; i++)
@@ -80,7 +81,7 @@ TEST_CASE("IEC 61937 rejects payload larger than burst", "[iec61937]")
     uint8_t encoded[6144]{};
     uint8_t burst[6144];
 
-    auto result = Iec61937::CreateBurst(encoded, 6144, 0x01, 6144, burst);
+    auto result = Iec61937::CreateBurst(encoded, 0x01, burst);
     CHECK(!result.has_value());
     CHECK(result.error() == Iec61937::BurstError::PayloadTooLarge);
 }

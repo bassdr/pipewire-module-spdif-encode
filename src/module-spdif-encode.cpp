@@ -148,9 +148,9 @@ static void OnCaptureProcess(void* userData)
         }
 
         // IEC 61937 framing
-        auto burstResult = Iec61937::CreateBurst(data->m_EncodeBuf.data(), *encodeResult,
-                                                  Ac3Encoder::DataType, Ac3Encoder::BurstSize,
-                                                  data->m_BurstBuf.data());
+        auto burstResult = Iec61937::CreateBurst(
+            {data->m_EncodeBuf.data(), *encodeResult},
+            Ac3Encoder::DataType, data->m_BurstBuf);
         if (!burstResult)
         {
             continue;
@@ -206,24 +206,34 @@ static void OnPlaybackProcess(void* userData)
         outFrames = maxFrames;
     }
 
-    auto* dst = static_cast<int16_t*>(spaBuf->datas[0].data);
+    auto output = std::span(static_cast<int16_t*>(spaBuf->datas[0].data),
+                            outFrames * OutputChannels);
 
-    // Drain output ring into the PipeWire buffer
-    uint32_t const ringFrames = std::min(outFrames, static_cast<uint32_t>(data->m_OutRingStored));
-    for (uint32_t i = 0; i < ringFrames * OutputChannels; ++i)
+    // Drain output ring into the PipeWire buffer (up to two contiguous segments)
+    uint32_t const ringSamples = std::min(outFrames, static_cast<uint32_t>(data->m_OutRingStored))
+                                 * OutputChannels;
+    size_t const firstRun = std::min(static_cast<size_t>(ringSamples),
+                                     ModuleData::OutRingSamples - data->m_OutRingReadPos);
+    auto ringStart = data->m_OutRingBuf.begin() + data->m_OutRingReadPos;
+
+    auto it = std::ranges::copy(ringStart, ringStart + firstRun, output.begin()).out;
+    if (firstRun < ringSamples)
     {
-        dst[i] = data->m_OutRingBuf[data->m_OutRingReadPos];
-        data->m_OutRingReadPos = (data->m_OutRingReadPos + 1) % ModuleData::OutRingSamples;
+        it = std::ranges::copy_n(data->m_OutRingBuf.begin(), ringSamples - firstRun, it).out;
     }
-    data->m_OutRingStored -= ringFrames;
+    data->m_OutRingReadPos = (data->m_OutRingReadPos + ringSamples) % ModuleData::OutRingSamples;
+    data->m_OutRingStored -= ringSamples / OutputChannels;
 
     // Zero-fill remainder (IEC 61937 silence = zeros)
-    std::memset(dst + ringFrames * OutputChannels, 0,
-                (outFrames - ringFrames) * sizeof(int16_t) * OutputChannels);
+    std::ranges::fill(std::span(it, output.end()), int16_t{0});
 
-    spaBuf->datas[0].chunk->offset = 0;
-    spaBuf->datas[0].chunk->size = outFrames * sizeof(int16_t) * OutputChannels;
-    spaBuf->datas[0].chunk->stride = sizeof(int16_t) * OutputChannels;
+    static constexpr int32_t FrameBytes = sizeof(int16_t) * OutputChannels;
+    *spaBuf->datas[0].chunk = {
+        .offset = 0,
+        .size = outFrames * static_cast<uint32_t>(FrameBytes),
+        .stride = FrameBytes,
+        .flags = {},
+    };
 }
 
 static void ForceUnitVolume(pw_stream* stream)
@@ -246,6 +256,32 @@ static void ForceUnitVolume(pw_stream* stream)
     pw_stream_set_param(stream, SPA_PARAM_Props, param);
 }
 
+static bool HasNonUnitVolume(spa_pod_object const* obj, uint32_t key)
+{
+    auto const* prop = spa_pod_object_find_prop(obj, nullptr, key);
+    if (!prop)
+    {
+        return false;
+    }
+
+    std::array<float, SPA_AUDIO_MAX_CHANNELS> vols{};
+    uint32_t n = spa_pod_copy_array(&prop->value, SPA_TYPE_Float, vols.data(), vols.size());
+    return std::ranges::any_of(std::span(vols).first(n), [](float v) { return v != 1.0f; });
+}
+
+static bool HasMute(spa_pod_object const* obj)
+{
+    auto const* prop = spa_pod_object_find_prop(obj, nullptr, SPA_PROP_mute);
+    if (!prop)
+    {
+        return false;
+    }
+
+    bool muted = false;
+    spa_pod_get_bool(&prop->value, &muted);
+    return muted;
+}
+
 static void OnPlaybackParamChanged(void* userData, uint32_t id, spa_pod const* param)
 {
     if (id != SPA_PARAM_Props || !param)
@@ -253,41 +289,15 @@ static void OnPlaybackParamChanged(void* userData, uint32_t id, spa_pod const* p
         return;
     }
 
-    auto* data = static_cast<ModuleData*>(userData);
-    bool needsReset = false;
     auto const* obj = reinterpret_cast<spa_pod_object const*>(param);
-    spa_pod_prop const* prop;
 
-    SPA_POD_OBJECT_FOREACH(obj, prop)
-    {
-        if (prop->key == SPA_PROP_channelVolumes || prop->key == SPA_PROP_softVolumes)
-        {
-            float vols[SPA_AUDIO_MAX_CHANNELS];
-            uint32_t n = spa_pod_copy_array(&prop->value, SPA_TYPE_Float, vols, SPA_AUDIO_MAX_CHANNELS);
-            for (uint32_t i = 0; i < n; ++i)
-            {
-                if (vols[i] != 1.0f)
-                {
-                    needsReset = true;
-                    break;
-                }
-            }
-        }
-        else if (prop->key == SPA_PROP_mute)
-        {
-            bool muted = false;
-            spa_pod_get_bool(&prop->value, &muted);
-            if (muted)
-            {
-                needsReset = true;
-            }
-        }
-    }
-
-    if (needsReset)
+    if (HasNonUnitVolume(obj, SPA_PROP_channelVolumes)
+        || HasNonUnitVolume(obj, SPA_PROP_softVolumes)
+        || HasMute(obj))
     {
         pw_log_warn("spdif-encode: volume/mute changed on output stream, "
                     "resetting to 1.0 (encoded bitstream cannot be volume-adjusted)");
+        auto* data = static_cast<ModuleData*>(userData);
         ForceUnitVolume(data->m_PlaybackStream.get());
     }
 }
