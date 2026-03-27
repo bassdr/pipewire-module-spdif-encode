@@ -39,8 +39,6 @@ inline BurstResult CreateBurst(std::span<uint8_t const> encodedFrame,
         return std::unexpected(BurstError::PayloadTooLarge);
     }
 
-    std::ranges::fill(outputBuf, uint8_t{0});
-
     BurstHeader const header
     {
         .Pc = dataType,
@@ -66,6 +64,10 @@ inline BurstResult CreateBurst(std::span<uint8_t const> encodedFrame,
         tail[0] = 0;
         tail[1] = encodedFrame[encodedSize - 1];
     }
+
+    // Zero only the padding after header + payload (round up to even byte count)
+    uint32_t const payloadEnd = sizeof(header) + ((encodedSize + 1) & ~1u);
+    std::memset(outputBuf.data() + payloadEnd, 0, burstSize - payloadEnd);
 
     return burstSize;
 }

@@ -7,7 +7,6 @@
 #include <cstring>
 #include <memory>
 #include <optional>
-#include <ranges>
 #include <span>
 
 extern "C"
@@ -42,45 +41,114 @@ struct ModuleData
 
     std::optional<Ac3Encoder> m_Enc;
 
-    // Ring buffer for accumulating interleaved S16 samples
-    static constexpr size_t MaxQuantum = 8192;
-    static constexpr size_t RingBufSize = Ac3Encoder::FrameSize * InputChannels * 4;
-    std::array<int16_t, RingBufSize> m_RingBuf{};
-    size_t m_RingWritePos{};
-    size_t m_RingSamplesStored{};  // per-channel sample count
+    // Residual buffer: holds leftover F32P samples between quantums that
+    // didn't fill a complete 1536-sample AC3 frame.  At most 1535 samples
+    // per channel can be pending.
+    static constexpr size_t MaxResidual = Ac3Encoder::FrameSize - 1;
+    std::array<std::array<float, MaxResidual>, InputChannels> m_Residual{};
+    size_t m_ResidualCount{};  // per-channel sample count
 
-    // Scratch buffer for F32P → S16 interleaved conversion
-    std::array<int16_t, MaxQuantum * InputChannels> m_InterleavedBuf{};
-
-    // Encoding workspace
+    // Encoding workspace — holds raw AC3 bitstream from encoder
     std::array<uint8_t, Ac3Encoder::BurstSize> m_EncodeBuf{};
-    std::array<uint8_t, Ac3Encoder::BurstSize> m_BurstBuf{};
 
-    // Output ring buffer: stores IEC 61937 bursts as S16LE stereo samples.
-    // Each AC3 burst is 1536 stereo frames (6144 bytes).  Ring holds 4 bursts.
+    // Output ring buffer: stores IEC 61937 bursts as raw bytes.
+    // Each AC3 burst is exactly BurstSize (6144) bytes.  Ring holds 4 bursts.
+    // Write position is always burst-aligned so bursts never straddle the wrap.
     static constexpr size_t BurstFrames = Ac3Encoder::BurstSize / (sizeof(int16_t) * OutputChannels);
-    static constexpr size_t OutRingFrames = BurstFrames * 4;
-    static constexpr size_t OutRingSamples = OutRingFrames * OutputChannels;
-    std::array<int16_t, OutRingSamples> m_OutRingBuf{};
-    size_t m_OutRingWritePos{};
-    size_t m_OutRingReadPos{};
-    size_t m_OutRingStored{};  // in stereo frames
+    static constexpr size_t OutRingBursts = 4;
+    static constexpr size_t OutRingBytes = Ac3Encoder::BurstSize * OutRingBursts;
+    std::array<uint8_t, OutRingBytes> m_OutRingBuf{};
+    size_t m_OutRingWritePos{};  // in bytes, always burst-aligned
+    size_t m_OutRingReadPos{};   // in bytes
+    size_t m_OutRingStored{};    // in bytes
 };
 
-[[gnu::always_inline]] static inline void ConvertF32PlanarToS16Interleaved(
-    std::span<std::span<float const> const> src, std::span<int16_t> dst)
+// Push an encoded AC3 frame into the output ring as an IEC 61937 burst.
+static void PushBurst(ModuleData* data, uint32_t encodedSize)
 {
-    size_t channels = src.size();
-    if (channels == 0 || dst.size() % channels != 0)
+    if (data->m_OutRingStored + Ac3Encoder::BurstSize > ModuleData::OutRingBytes)
     {
-        std::ranges::fill(dst, 0);
-        return;
+        // Output ring full — drop oldest burst
+        data->m_OutRingReadPos = (data->m_OutRingReadPos + Ac3Encoder::BurstSize)
+                                 % ModuleData::OutRingBytes;
+        data->m_OutRingStored -= Ac3Encoder::BurstSize;
     }
 
-    for (auto [idx, val] : std::views::enumerate(dst))
+    auto burstSpan = std::span(data->m_OutRingBuf.data() + data->m_OutRingWritePos,
+                               Ac3Encoder::BurstSize);
+    (void)Iec61937::CreateBurst({data->m_EncodeBuf.data(), encodedSize},
+                                Ac3Encoder::DataType, burstSpan);
+    data->m_OutRingWritePos = (data->m_OutRingWritePos + Ac3Encoder::BurstSize)
+                              % ModuleData::OutRingBytes;
+    data->m_OutRingStored += Ac3Encoder::BurstSize;
+}
+
+// Encode all complete AC3 frames from the available sample data.
+// 'channels' points to per-channel float arrays; samples [offset, offset+newSamples)
+// are the new data from this quantum.
+static void EncodeAvailable(ModuleData* data, float const* const* channels,
+                            size_t offset, size_t newSamples)
+{
+    size_t available = data->m_ResidualCount + newSamples;
+    size_t consumed = 0;  // new samples consumed so far
+
+    while (available >= static_cast<size_t>(Ac3Encoder::FrameSize))
     {
-        float sample = std::clamp(src[idx % channels][idx / channels], -1.0f, 1.0f);
-        val = static_cast<int16_t>(sample * 32767.0f);
+        float const* framePtrs[InputChannels];
+        int frameOffset = 0;
+
+        if (data->m_ResidualCount > 0)
+        {
+            // Composite frame: residual prefix + beginning of new data
+            // Use thread_local to avoid stack allocation every iteration
+            thread_local std::array<std::array<float, Ac3Encoder::FrameSize>, InputChannels> composite;
+
+            size_t const needed = Ac3Encoder::FrameSize - data->m_ResidualCount;
+            for (int ch = 0; ch < InputChannels; ++ch)
+            {
+                std::memcpy(composite[ch].data(), data->m_Residual[ch].data(),
+                            data->m_ResidualCount * sizeof(float));
+                std::memcpy(composite[ch].data() + data->m_ResidualCount,
+                            channels[ch] + offset + consumed, needed * sizeof(float));
+                framePtrs[ch] = composite[ch].data();
+            }
+            consumed += needed;
+            available -= Ac3Encoder::FrameSize;
+            data->m_ResidualCount = 0;
+        }
+        else
+        {
+            // Encode directly from source pointers at the right offset
+            for (int ch = 0; ch < InputChannels; ++ch)
+            {
+                framePtrs[ch] = channels[ch];
+            }
+            frameOffset = static_cast<int>(offset + consumed);
+            consumed += Ac3Encoder::FrameSize;
+            available -= Ac3Encoder::FrameSize;
+        }
+
+        auto encodeResult = data->m_Enc->EncodeFrame(
+            framePtrs, frameOffset, Ac3Encoder::FrameSize,
+            data->m_EncodeBuf.data(), data->m_EncodeBuf.size());
+        if (!encodeResult)
+        {
+            continue;
+        }
+
+        PushBurst(data, *encodeResult);
+    }
+
+    // Store remaining samples as residual for next quantum
+    if (available > 0)
+    {
+        size_t const tailStart = offset + consumed;
+        for (int ch = 0; ch < InputChannels; ++ch)
+        {
+            std::memcpy(data->m_Residual[ch].data(), channels[ch] + tailStart,
+                        available * sizeof(float));
+        }
+        data->m_ResidualCount = available;
     }
 }
 
@@ -94,85 +162,22 @@ static void OnCaptureProcess(void* userData)
     }
 
     spa_buffer* spaBuf = buf->buffer;
-    size_t sampleCount = std::min(spaBuf->datas[0].chunk->size / sizeof(float), ModuleData::MaxQuantum);
+    size_t sampleCount = spaBuf->datas[0].chunk->size / sizeof(float);
 
-    // Collect channel spans (F32P = one spa_data per channel)
-    static std::array<float, ModuleData::MaxQuantum> const silence{};
+    // Collect channel pointers (F32P = one spa_data per channel)
+    static std::array<float, 8192> const silence{};
 
-    std::array<std::span<float const>, InputChannels> channels;
-    for (auto [ch, span] : std::views::enumerate(channels))
+    float const* channels[InputChannels];
+    for (int ch = 0; ch < InputChannels; ++ch)
     {
-        auto* ptr = (ch < spaBuf->n_datas && spaBuf->datas[ch].data)
-                        ? static_cast<float const*>(spaBuf->datas[ch].data)
-                        : silence.data();
-        span = {ptr, sampleCount};
+        channels[ch] = (ch < static_cast<int>(spaBuf->n_datas) && spaBuf->datas[ch].data)
+                            ? static_cast<float const*>(spaBuf->datas[ch].data)
+                            : silence.data();
     }
 
-    // Convert to interleaved S16 and write into ring buffer
-    std::span<int16_t> interleaved{data->m_InterleavedBuf.data(),
-                                    sampleCount * InputChannels};
-    ConvertF32PlanarToS16Interleaved(channels, interleaved);
-
-    for (int16_t sample : interleaved)
-    {
-        data->m_RingBuf[data->m_RingWritePos] = sample;
-        data->m_RingWritePos = (data->m_RingWritePos + 1) % ModuleData::RingBufSize;
-    }
-    data->m_RingSamplesStored += sampleCount;
+    EncodeAvailable(data, channels, 0, sampleCount);
 
     pw_stream_queue_buffer(data->m_CaptureStream.get(), buf);
-
-    // Encode as many AC3 frames as we have input for, push bursts to output ring
-    while (data->m_RingSamplesStored >= static_cast<size_t>(Ac3Encoder::FrameSize))
-    {
-        // Read one frame from input ring
-        static constexpr size_t InterleavedFrameSize = Ac3Encoder::FrameSize * InputChannels;
-        std::array<int16_t, InterleavedFrameSize> frame{};
-        size_t readPos = (data->m_RingWritePos + ModuleData::RingBufSize
-                          - data->m_RingSamplesStored * InputChannels) % ModuleData::RingBufSize;
-
-        for (int16_t& sample : frame)
-        {
-            sample = data->m_RingBuf[readPos];
-            readPos = (readPos + 1) % ModuleData::RingBufSize;
-        }
-        data->m_RingSamplesStored -= Ac3Encoder::FrameSize;
-
-        // Encode AC3
-        auto encodeResult = data->m_Enc->EncodeFrame(frame.data(), Ac3Encoder::FrameSize,
-                                                     data->m_EncodeBuf.data(),
-                                                     data->m_EncodeBuf.size());
-        if (!encodeResult)
-        {
-            continue;
-        }
-
-        // IEC 61937 framing
-        auto burstResult = Iec61937::CreateBurst(
-            {data->m_EncodeBuf.data(), *encodeResult},
-            Ac3Encoder::DataType, data->m_BurstBuf);
-        if (!burstResult)
-        {
-            continue;
-        }
-
-        // Push burst to output ring (as S16LE stereo samples)
-        if (data->m_OutRingStored + ModuleData::BurstFrames > ModuleData::OutRingFrames)
-        {
-            // Output ring full — drop oldest burst to avoid blocking
-            data->m_OutRingReadPos = (data->m_OutRingReadPos + ModuleData::BurstFrames * OutputChannels)
-                                     % ModuleData::OutRingSamples;
-            data->m_OutRingStored -= ModuleData::BurstFrames;
-        }
-
-        auto const* burstSamples = reinterpret_cast<int16_t const*>(data->m_BurstBuf.data());
-        for (size_t i = 0; i < ModuleData::BurstFrames * OutputChannels; ++i)
-        {
-            data->m_OutRingBuf[data->m_OutRingWritePos] = burstSamples[i];
-            data->m_OutRingWritePos = (data->m_OutRingWritePos + 1) % ModuleData::OutRingSamples;
-        }
-        data->m_OutRingStored += ModuleData::BurstFrames;
-    }
 
     // Always trigger playback to drain the output ring
     pw_stream_trigger_process(data->m_PlaybackStream.get());
@@ -206,31 +211,30 @@ static void OnPlaybackProcess(void* userData)
         outFrames = maxFrames;
     }
 
-    auto output = std::span(static_cast<int16_t*>(spaBuf->datas[0].data),
-                            outFrames * OutputChannels);
+    uint32_t const outBytes = outFrames * sizeof(int16_t) * OutputChannels;
+    auto output = std::span(static_cast<uint8_t*>(spaBuf->datas[0].data), outBytes);
 
     // Drain output ring into the PipeWire buffer (up to two contiguous segments)
-    uint32_t const ringSamples = std::min(outFrames, static_cast<uint32_t>(data->m_OutRingStored))
-                                 * OutputChannels;
-    size_t const firstRun = std::min(static_cast<size_t>(ringSamples),
-                                     ModuleData::OutRingSamples - data->m_OutRingReadPos);
+    uint32_t const ringBytes = std::min(outBytes, static_cast<uint32_t>(data->m_OutRingStored));
+    size_t const firstRun = std::min(static_cast<size_t>(ringBytes),
+                                     ModuleData::OutRingBytes - data->m_OutRingReadPos);
     auto ringStart = data->m_OutRingBuf.begin() + data->m_OutRingReadPos;
 
     auto it = std::ranges::copy(ringStart, ringStart + firstRun, output.begin()).out;
-    if (firstRun < ringSamples)
+    if (firstRun < ringBytes)
     {
-        it = std::ranges::copy_n(data->m_OutRingBuf.begin(), ringSamples - firstRun, it).out;
+        it = std::ranges::copy_n(data->m_OutRingBuf.begin(), ringBytes - firstRun, it).out;
     }
-    data->m_OutRingReadPos = (data->m_OutRingReadPos + ringSamples) % ModuleData::OutRingSamples;
-    data->m_OutRingStored -= ringSamples / OutputChannels;
+    data->m_OutRingReadPos = (data->m_OutRingReadPos + ringBytes) % ModuleData::OutRingBytes;
+    data->m_OutRingStored -= ringBytes;
 
     // Zero-fill remainder (IEC 61937 silence = zeros)
-    std::ranges::fill(std::span(it, output.end()), int16_t{0});
+    std::ranges::fill(std::span(it, output.end()), uint8_t{0});
 
     static constexpr int32_t FrameBytes = sizeof(int16_t) * OutputChannels;
     *spaBuf->datas[0].chunk = {
         .offset = 0,
-        .size = outFrames * static_cast<uint32_t>(FrameBytes),
+        .size = outBytes,
         .stride = FrameBytes,
         .flags = {},
     };
@@ -420,7 +424,7 @@ int pipewire__module_init(pw_impl_module* module, char const* args)
         PW_KEY_MEDIA_CATEGORY, "Playback",
         PW_KEY_MEDIA_CLASS, "Stream/Output/Audio",
         PW_KEY_NODE_DONT_RECONNECT, "true",
-        PW_KEY_NODE_LATENCY, "1536/48000",
+        PW_KEY_NODE_LATENCY, "512/48000",
         PW_KEY_NODE_RATE, "1/48000",
         "stream.dont-remix", "true",
         "channelmix.disable", "true",

@@ -27,7 +27,9 @@ struct Ac3Encoder
 
     static std::expected<Ac3Encoder, InitError> Create(int channels, int sampleRate, int bitrate);
 
-    EncodeResult EncodeFrame(int16_t const* samples, int sampleCount,
+    // Encode from F32 planar channel pointers (one float* per channel).
+    // Reads 'sampleCount' samples starting at 'offset' from each channel.
+    EncodeResult EncodeFrame(float const* const* channels, int offset, int sampleCount,
                              uint8_t* outputBuf, size_t outputBufSize);
 
 private:
