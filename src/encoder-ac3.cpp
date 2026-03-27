@@ -8,12 +8,14 @@ extern "C"
 
 #include <algorithm>
 #include <cstring>
+#include <ranges>
+#include <span>
 
 void AVCodecContextDeleter::operator()(AVCodecContext* p) const { avcodec_free_context(&p); }
 void AVFrameDeleter::operator()(AVFrame* p) const { av_frame_free(&p); }
 void AVPacketDeleter::operator()(AVPacket* p) const { av_packet_free(&p); }
 
-std::expected<Ac3Encoder, InitError> Ac3Encoder::Create(int channels, int sampleRate, int bitrate)
+std::expected<Ac3Encoder, InitError> Ac3Encoder::Create(int channels, int sampleRate, int64_t bitrate)
 {
     // Prefer fixed-point encoder for RT safety
     AVCodec const* codec = avcodec_find_encoder_by_name("ac3_fixed");
@@ -83,7 +85,7 @@ std::expected<Ac3Encoder, InitError> Ac3Encoder::Create(int channels, int sample
     return enc;
 }
 
-EncodeResult Ac3Encoder::EncodeFrame(float const* const* channels, int offset, int sampleCount,
+EncodeResult Ac3Encoder::EncodeFrame(std::array<float const*, InputChannels> channels, size_t offset, uint16_t sampleCount,
                                      uint8_t* outputBuf, size_t outputBufSize)
 {
     if (sampleCount < FrameSize)
@@ -91,38 +93,38 @@ EncodeResult Ac3Encoder::EncodeFrame(float const* const* channels, int offset, i
         return std::unexpected(EncodeError::InsufficientSamples);
     }
 
-    int const numCh = m_CodecCtx->ch_layout.nb_channels;
+    auto const frameBufs = std::span{m_Frame->data, static_cast<size_t>(m_CodecCtx->ch_layout.nb_channels)};
 
     // Convert F32P input directly into the codec's planar frame buffers.
     // The frame is exclusively owned — av_frame_make_writable() is unnecessary.
     switch (m_CodecCtx->sample_fmt)
     {
-    case AV_SAMPLE_FMT_S32P:
-        for (int ch = 0; ch < numCh; ++ch)
+    case AV_SAMPLE_FMT_S16P:
+        for (auto&& [buf, chPtr] : std::views::zip(frameBufs, channels))
         {
-            auto* dst = reinterpret_cast<int32_t*>(m_Frame->data[ch]);
-            float const* src = channels[ch] + offset;
-            for (int i = 0; i < FrameSize; ++i)
+            auto dst = std::span(reinterpret_cast<int16_t*>(buf), FrameSize);
+            auto src = std::span(chPtr + offset, FrameSize);
+            for (auto&& [d, s] : std::views::zip(dst, src))
             {
-                dst[i] = static_cast<int32_t>(std::clamp(src[i], -1.0f, 1.0f) * 2147483647.0f);
+                d = static_cast<int16_t>(std::clamp(s, -1.0f, 1.0f) * 32767.0f);
             }
         }
         break;
-    case AV_SAMPLE_FMT_S16P:
-        for (int ch = 0; ch < numCh; ++ch)
+    case AV_SAMPLE_FMT_S32P:
+        for (auto&& [buf, chPtr] : std::views::zip(frameBufs, channels))
         {
-            auto* dst = reinterpret_cast<int16_t*>(m_Frame->data[ch]);
-            float const* src = channels[ch] + offset;
-            for (int i = 0; i < FrameSize; ++i)
+            auto dst = std::span(reinterpret_cast<int32_t*>(buf), FrameSize);
+            auto src = std::span(chPtr + offset, FrameSize);
+            for (auto&& [d, s] : std::views::zip(dst, src))
             {
-                dst[i] = static_cast<int16_t>(std::clamp(src[i], -1.0f, 1.0f) * 32767.0f);
+                d = static_cast<int32_t>(std::clamp(s, -1.0f, 1.0f) * 2147483647.0f);
             }
         }
         break;
     case AV_SAMPLE_FMT_FLTP:
-        for (int ch = 0; ch < numCh; ++ch)
+        for (auto&& [buf, chPtr] : std::views::zip(frameBufs, channels))
         {
-            std::memcpy(m_Frame->data[ch], channels[ch] + offset, FrameSize * sizeof(float));
+            std::memcpy(buf, chPtr + offset, FrameSize * sizeof(float));
         }
         break;
     default:

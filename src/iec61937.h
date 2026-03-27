@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdint>
 #include <cstring>
@@ -24,24 +25,30 @@ struct BurstHeader
 enum class BurstError : uint8_t
 {
     PayloadTooLarge,
+    LengthFieldOverflow,
 };
 
-using BurstResult = std::expected<uint32_t, BurstError>;
+using BurstResult = std::expected<void, BurstError>;
 
+template <uint16_t DataType, size_t BurstSize>
 inline BurstResult CreateBurst(std::span<uint8_t const> encodedFrame,
-                               uint16_t dataType, std::span<uint8_t> outputBuf)
+                               std::span<uint8_t, BurstSize> outputBuf)
 {
-    uint32_t const encodedSize = static_cast<uint32_t>(encodedFrame.size());
-    uint32_t const burstSize = static_cast<uint32_t>(outputBuf.size());
+    size_t const encodedSize = encodedFrame.size();
 
-    if (encodedSize + sizeof(BurstHeader) > burstSize)
+    if (encodedSize + sizeof(BurstHeader) > BurstSize)
     {
         return std::unexpected(BurstError::PayloadTooLarge);
     }
 
+    if (encodedSize > UINT16_MAX / 8)
+    {
+        return std::unexpected(BurstError::LengthFieldOverflow);
+    }
+
     BurstHeader const header
     {
-        .Pc = dataType,
+        .Pc = DataType,
         .Pd = static_cast<uint16_t>(encodedSize * 8),
     };
     std::memcpy(outputBuf.data(), &header, sizeof(header));
@@ -66,10 +73,17 @@ inline BurstResult CreateBurst(std::span<uint8_t const> encodedFrame,
     }
 
     // Zero only the padding after header + payload (round up to even byte count)
-    uint32_t const payloadEnd = sizeof(header) + ((encodedSize + 1) & ~1u);
-    std::memset(outputBuf.data() + payloadEnd, 0, burstSize - payloadEnd);
+    size_t const payloadEnd = sizeof(header) + ((encodedSize + 1) & ~size_t{1});
+    std::memset(outputBuf.data() + payloadEnd, 0, BurstSize - payloadEnd);
 
-    return burstSize;
+    return {};
+}
+
+template <uint16_t DataType, size_t BurstSize>
+inline BurstResult CreateBurst(std::span<uint8_t const> encodedFrame,
+                               std::array<uint8_t, BurstSize>& outputBuf)
+{
+    return CreateBurst<DataType>(encodedFrame, std::span<uint8_t, BurstSize>(outputBuf));
 }
 
 } // namespace Iec61937

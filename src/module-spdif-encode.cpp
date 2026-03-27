@@ -5,8 +5,10 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <format>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <span>
 
 extern "C"
@@ -19,10 +21,10 @@ extern "C"
 #include <spa/pod/iter.h>
 }
 
-static constexpr int InputChannels = 6;
-static constexpr int OutputChannels = 2;
-static constexpr int SampleRate = 48000;
-static constexpr int DefaultBitrate = 448000;
+static constexpr uint8_t OutputChannels = 2;
+static constexpr uint32_t SampleRate = 48000;
+static constexpr uint32_t DefaultBitrate = 448000;
+static constexpr uint32_t MaxQuantum = 8192;
 
 struct PWStreamDeleter { void operator()(pw_stream* s) const { pw_stream_destroy(s); } };
 using UniquePWStream = std::unique_ptr<pw_stream, PWStreamDeleter>;
@@ -45,7 +47,7 @@ struct ModuleData
     // didn't fill a complete 1536-sample AC3 frame.  At most 1535 samples
     // per channel can be pending.
     static constexpr size_t MaxResidual = Ac3Encoder::FrameSize - 1;
-    std::array<std::array<float, MaxResidual>, InputChannels> m_Residual{};
+    std::array<std::array<float, MaxResidual>, Ac3Encoder::InputChannels> m_Residual{};
     size_t m_ResidualCount{};  // per-channel sample count
 
     // Encoding workspace — holds raw AC3 bitstream from encoder
@@ -74,10 +76,12 @@ static void PushBurst(ModuleData* data, uint32_t encodedSize)
         data->m_OutRingStored -= Ac3Encoder::BurstSize;
     }
 
-    auto burstSpan = std::span(data->m_OutRingBuf.data() + data->m_OutRingWritePos,
-                               Ac3Encoder::BurstSize);
-    (void)Iec61937::CreateBurst({data->m_EncodeBuf.data(), encodedSize},
-                                Ac3Encoder::DataType, burstSpan);
+    if (!Iec61937::CreateBurst<Ac3Encoder::DataType>(
+        {data->m_EncodeBuf.data(), encodedSize},
+        std::span<uint8_t, Ac3Encoder::BurstSize>(data->m_OutRingBuf.data() + data->m_OutRingWritePos, Ac3Encoder::BurstSize)))
+    {
+        return;
+    }
     data->m_OutRingWritePos = (data->m_OutRingWritePos + Ac3Encoder::BurstSize)
                               % ModuleData::OutRingBytes;
     data->m_OutRingStored += Ac3Encoder::BurstSize;
@@ -86,31 +90,31 @@ static void PushBurst(ModuleData* data, uint32_t encodedSize)
 // Encode all complete AC3 frames from the available sample data.
 // 'channels' points to per-channel float arrays; samples [offset, offset+newSamples)
 // are the new data from this quantum.
-static void EncodeAvailable(ModuleData* data, float const* const* channels,
-                            size_t offset, size_t newSamples)
+static void EncodeAvailable(ModuleData* data, std::array<float const*, Ac3Encoder::InputChannels> channels, size_t newSamples)
 {
     size_t available = data->m_ResidualCount + newSamples;
     size_t consumed = 0;  // new samples consumed so far
 
     while (available >= static_cast<size_t>(Ac3Encoder::FrameSize))
     {
-        float const* framePtrs[InputChannels];
-        int frameOffset = 0;
+        std::array<float const*, Ac3Encoder::InputChannels> framePtrs;
+        size_t frameOffset = 0;
 
         if (data->m_ResidualCount > 0)
         {
             // Composite frame: residual prefix + beginning of new data
             // Use thread_local to avoid stack allocation every iteration
-            thread_local std::array<std::array<float, Ac3Encoder::FrameSize>, InputChannels> composite;
+            thread_local std::array<std::array<float, Ac3Encoder::FrameSize>, Ac3Encoder::InputChannels> composite;
 
             size_t const needed = Ac3Encoder::FrameSize - data->m_ResidualCount;
-            for (int ch = 0; ch < InputChannels; ++ch)
+            for (auto&& [comp, res, chPtr, fPtr] : std::views::zip(
+                     composite, data->m_Residual, channels, framePtrs))
             {
-                std::memcpy(composite[ch].data(), data->m_Residual[ch].data(),
+                std::memcpy(comp.data(), res.data(),
                             data->m_ResidualCount * sizeof(float));
-                std::memcpy(composite[ch].data() + data->m_ResidualCount,
-                            channels[ch] + offset + consumed, needed * sizeof(float));
-                framePtrs[ch] = composite[ch].data();
+                std::memcpy(comp.data() + data->m_ResidualCount,
+                            chPtr + consumed, needed * sizeof(float));
+                fPtr = comp.data();
             }
             consumed += needed;
             available -= Ac3Encoder::FrameSize;
@@ -119,11 +123,11 @@ static void EncodeAvailable(ModuleData* data, float const* const* channels,
         else
         {
             // Encode directly from source pointers at the right offset
-            for (int ch = 0; ch < InputChannels; ++ch)
+            for (auto&& [fPtr, chPtr] : std::views::zip(framePtrs, channels))
             {
-                framePtrs[ch] = channels[ch];
+                fPtr = chPtr;
             }
-            frameOffset = static_cast<int>(offset + consumed);
+            frameOffset = consumed;
             consumed += Ac3Encoder::FrameSize;
             available -= Ac3Encoder::FrameSize;
         }
@@ -139,16 +143,16 @@ static void EncodeAvailable(ModuleData* data, float const* const* channels,
         PushBurst(data, *encodeResult);
     }
 
-    // Store remaining samples as residual for next quantum
-    if (available > 0)
+    // Append unconsumed new samples after any existing residual
+    size_t const newRemaining = newSamples - consumed;
+    if (newRemaining > 0)
     {
-        size_t const tailStart = offset + consumed;
-        for (int ch = 0; ch < InputChannels; ++ch)
+        for (auto&& [res, chPtr] : std::views::zip(data->m_Residual, channels))
         {
-            std::memcpy(data->m_Residual[ch].data(), channels[ch] + tailStart,
-                        available * sizeof(float));
+            std::memcpy(res.data() + data->m_ResidualCount, chPtr + consumed,
+                        newRemaining * sizeof(float));
         }
-        data->m_ResidualCount = available;
+        data->m_ResidualCount += newRemaining;
     }
 }
 
@@ -165,17 +169,18 @@ static void OnCaptureProcess(void* userData)
     size_t sampleCount = spaBuf->datas[0].chunk->size / sizeof(float);
 
     // Collect channel pointers (F32P = one spa_data per channel)
-    static std::array<float, 8192> const silence{};
+    static std::array<float, MaxQuantum> const silence{};
 
-    float const* channels[InputChannels];
-    for (int ch = 0; ch < InputChannels; ++ch)
+    std::array<float const*, Ac3Encoder::InputChannels> channels;
+    for (auto&& [ch, ptr] : std::views::enumerate(channels))
     {
-        channels[ch] = (ch < static_cast<int>(spaBuf->n_datas) && spaBuf->datas[ch].data)
-                            ? static_cast<float const*>(spaBuf->datas[ch].data)
-                            : silence.data();
+        auto idx = static_cast<uint32_t>(ch);
+        ptr = (idx < spaBuf->n_datas && spaBuf->datas[idx].data)
+                  ? static_cast<float const*>(spaBuf->datas[idx].data)
+                  : silence.data();
     }
 
-    EncodeAvailable(data, channels, 0, sampleCount);
+    EncodeAvailable(data, channels, sampleCount);
 
     pw_stream_queue_buffer(data->m_CaptureStream.get(), buf);
 
@@ -204,18 +209,17 @@ static void OnPlaybackProcess(void* userData)
     // Determine how many stereo frames the output buffer can hold
     uint32_t const maxFrames = spaBuf->datas[0].maxsize / (sizeof(int16_t) * OutputChannels);
 
-    // Use buf->requested if available (= quantum), else fill the buffer
-    uint32_t outFrames = buf->requested ? static_cast<uint32_t>(buf->requested) : maxFrames;
-    if (outFrames > maxFrames)
-    {
-        outFrames = maxFrames;
-    }
+    // Use buf->requested if available (= quantum), else fill the buffer.
+    // std::min handles the uint64_t -> uint32_t narrowing safely since maxFrames is uint32_t.
+    uint32_t const outFrames = buf->requested
+        ? static_cast<uint32_t>(std::min(static_cast<uint64_t>(maxFrames), buf->requested))
+        : maxFrames;
 
     uint32_t const outBytes = outFrames * sizeof(int16_t) * OutputChannels;
     auto output = std::span(static_cast<uint8_t*>(spaBuf->datas[0].data), outBytes);
 
     // Drain output ring into the PipeWire buffer (up to two contiguous segments)
-    uint32_t const ringBytes = std::min(outBytes, static_cast<uint32_t>(data->m_OutRingStored));
+    size_t const ringBytes = std::min(static_cast<size_t>(outBytes), data->m_OutRingStored);
     size_t const firstRun = std::min(static_cast<size_t>(ringBytes),
                                      ModuleData::OutRingBytes - data->m_OutRingReadPos);
     auto ringStart = data->m_OutRingBuf.begin() + data->m_OutRingReadPos;
@@ -360,7 +364,7 @@ int pipewire__module_init(pw_impl_module* module, char const* args)
     data->m_Module = module;
     data->m_Context = pw_impl_module_get_context(module);
 
-    auto enc = Ac3Encoder::Create(InputChannels, SampleRate, DefaultBitrate);
+    auto enc = Ac3Encoder::Create(Ac3Encoder::InputChannels, SampleRate, DefaultBitrate);
     if (!enc)
     {
         pw_log_error("spdif-encode: failed to initialize AC3 encoder");
@@ -396,7 +400,7 @@ int pipewire__module_init(pw_impl_module* module, char const* args)
     spa_audio_info_raw captureInfo{};
     captureInfo.format = SPA_AUDIO_FORMAT_F32P;
     captureInfo.rate = SampleRate;
-    captureInfo.channels = InputChannels;
+    captureInfo.channels = Ac3Encoder::InputChannels;
     captureInfo.position[0] = SPA_AUDIO_CHANNEL_FL;
     captureInfo.position[1] = SPA_AUDIO_CHANNEL_FR;
     captureInfo.position[2] = SPA_AUDIO_CHANNEL_FC;
@@ -424,8 +428,8 @@ int pipewire__module_init(pw_impl_module* module, char const* args)
         PW_KEY_MEDIA_CATEGORY, "Playback",
         PW_KEY_MEDIA_CLASS, "Stream/Output/Audio",
         PW_KEY_NODE_DONT_RECONNECT, "true",
-        PW_KEY_NODE_LATENCY, "512/48000",
-        PW_KEY_NODE_RATE, "1/48000",
+        PW_KEY_NODE_LATENCY, std::format("512/{}", SampleRate).c_str(),
+        PW_KEY_NODE_RATE, std::format("1/{}", SampleRate).c_str(),
         "stream.dont-remix", "true",
         "channelmix.disable", "true",
         "dither.noise", "0",

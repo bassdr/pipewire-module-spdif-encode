@@ -1,5 +1,3 @@
-catch2_dep = dependency('catch2-with-main')
-
 test_iec61937 = executable(
     'test-iec61937',
     'test-iec61937.cpp',

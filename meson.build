@@ -11,9 +11,9 @@ project(
     license : 'MIT',
 )
 
-pipewire_dep = dependency('libpipewire-0.3', version : '>= 0.3.0')
-libavcodec_dep = dependency('libavcodec')
-libavutil_dep = dependency('libavutil')
+pipewire_dep = dependency('libpipewire-0.3', version : '>= 0.3.0', include_type : 'system')
+libavcodec_dep = dependency('libavcodec', include_type : 'system')
+libavutil_dep = dependency('libavutil', include_type : 'system')
 
 pipewire_moduledir = pipewire_dep.get_variable(pkgconfig : 'moduledir')
 
@@ -34,6 +34,9 @@ shared_library(
     name_prefix : 'lib',
 )
 
-if get_option('tests')
-    subdir('tests')
+if get_option('test').allowed()
+    catch2_dep = dependency('catch2-with-main', required : get_option('test'))
+    if catch2_dep.found()
+        subdir('tests')
+    endif
 endif

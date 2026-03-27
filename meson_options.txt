@@ -1,1 +1,1 @@
-option('tests', type : 'boolean', value : false, description : 'Build and run tests (requires Catch2)')
+option('test', type : 'feature', value : 'auto', description : 'Build and run tests (requires Catch2)')

@@ -2,28 +2,30 @@
 
 #include "../src/encoder-ac3.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
-#include <vector>
+#include <ranges>
 
-static constexpr int Channels = 6;
+static constexpr uint8_t Channels = Ac3Encoder::InputChannels;
 
-// Helper: create F32P silence buffers and return channel pointers
+// Helper: create F32P buffers with compile-time sample count and return channel pointers
+template <size_t Samples>
 struct F32PBuffer
 {
-    std::array<std::vector<float>, Channels> ch;
-    std::array<float const*, Channels> ptrs;
+    std::array<std::array<float, Samples>, Channels> ch{};
+    std::array<float const*, Channels> ptrs{};
 
-    F32PBuffer(int samples, float value = 0.0f)
+    F32PBuffer(float value = 0.0f)
     {
-        for (int c = 0; c < Channels; ++c)
+        for (auto&& [arr, ptr] : std::views::zip(ch, ptrs))
         {
-            ch[c].assign(samples, value);
-            ptrs[c] = ch[c].data();
+            std::ranges::fill(arr, value);
+            ptr = arr.data();
         }
     }
 
-    float const* const* data() { return ptrs.data(); }
+    std::array<float const*, Channels> const& data() { return ptrs; }
 };
 
 TEST_CASE("AC3 encoder constants are correct", "[ac3]")
@@ -45,7 +47,7 @@ TEST_CASE("AC3 encoder rejects too few samples", "[ac3]")
     REQUIRE(enc.has_value());
 
     uint8_t outputBuf[6144];
-    F32PBuffer buf(100);
+    F32PBuffer<100> buf;
 
     auto result = enc->EncodeFrame(buf.data(), 0, 100, outputBuf, sizeof(outputBuf));
     CHECK(!result.has_value());
@@ -58,7 +60,7 @@ TEST_CASE("AC3 encoder produces valid output from silence", "[ac3]")
     REQUIRE(enc.has_value());
 
     uint8_t outputBuf[6144];
-    F32PBuffer buf(Ac3Encoder::FrameSize);
+    F32PBuffer<Ac3Encoder::FrameSize> buf;
 
     auto result = enc->EncodeFrame(buf.data(), 0, Ac3Encoder::FrameSize,
                                    outputBuf, sizeof(outputBuf));
@@ -73,14 +75,14 @@ TEST_CASE("AC3 encoder produces output from non-silent input", "[ac3]")
     auto enc = Ac3Encoder::Create(Channels, 48000, 448000);
     REQUIRE(enc.has_value());
 
-    F32PBuffer buf(Ac3Encoder::FrameSize);
-    for (int c = 0; c < Channels; ++c)
+    F32PBuffer<Ac3Encoder::FrameSize> buf;
+    for (auto&& [arr, ptr] : std::views::zip(buf.ch, buf.ptrs))
     {
-        for (int i = 0; i < Ac3Encoder::FrameSize; ++i)
+        for (auto&& [i, sample] : std::views::enumerate(arr))
         {
-            buf.ch[c][i] = std::sin(static_cast<float>(i) * 0.1f) * 0.5f;
+            sample = std::sin(static_cast<float>(i) * 0.1f) * 0.5f;
         }
-        buf.ptrs[c] = buf.ch[c].data();
+        ptr = arr.data();
     }
 
     uint8_t outputBuf[6144];
@@ -97,10 +99,10 @@ TEST_CASE("AC3 encoder can encode multiple consecutive frames", "[ac3]")
     auto enc = Ac3Encoder::Create(Channels, 48000, 448000);
     REQUIRE(enc.has_value());
 
-    F32PBuffer buf(Ac3Encoder::FrameSize, 0.3f);
+    F32PBuffer<Ac3Encoder::FrameSize> buf(0.3f);
     uint8_t outputBuf[6144];
 
-    for (int frame = 0; frame < 10; frame++)
+    for (auto frame : std::views::iota(0, 10))
     {
         auto result = enc->EncodeFrame(buf.data(), 0, Ac3Encoder::FrameSize,
                                        outputBuf, sizeof(outputBuf));
@@ -114,7 +116,7 @@ TEST_CASE("AC3 encoded output fits in IEC 61937 burst", "[ac3]")
     auto enc = Ac3Encoder::Create(Channels, 48000, 448000);
     REQUIRE(enc.has_value());
 
-    F32PBuffer buf(Ac3Encoder::FrameSize, 0.9f);
+    F32PBuffer<Ac3Encoder::FrameSize> buf(0.9f);
     uint8_t outputBuf[6144];
 
     auto result = enc->EncodeFrame(buf.data(), 0, Ac3Encoder::FrameSize,
@@ -131,8 +133,8 @@ TEST_CASE("AC3 encoder works with non-zero offset", "[ac3]")
     REQUIRE(enc.has_value());
 
     // Buffer with extra samples before the frame
-    int const offset = 512;
-    F32PBuffer buf(offset + Ac3Encoder::FrameSize, 0.5f);
+    size_t const offset = 512;
+    F32PBuffer<512 + Ac3Encoder::FrameSize> buf(0.5f);
     uint8_t outputBuf[6144];
 
     auto result = enc->EncodeFrame(buf.data(), offset, Ac3Encoder::FrameSize,

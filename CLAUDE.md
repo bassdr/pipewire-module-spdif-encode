@@ -126,19 +126,24 @@ Goal: select the virtual sink in pavucontrol, hear 5.1 audio encoded through S/P
 8. **`meson_options.txt`** — options for enabling/disabling codecs
 9. Module arg `codec=ac3|dts` to select at load time (or auto-detect from hardware caps)
 
-### Phase 3: Polish
+### Phase 3: Passthrough & polish
 
-10. Channel layout flexibility (5.1, 7.1 downmix, stereo passthrough)
+10. **Encoded passthrough** — detect already-encoded AC3/DTS input and forward directly to IEC 61937 framing (skip re-encoding). Requires advertising encoded format support on the capture sink, runtime format detection, and AC3 sync-word validation.
 11. Bitrate configuration via module args
-12. Proper latency reporting to PipeWire
-13. Distribution packaging
-14. Handle device hot-plug (S/PDIF cable connect/disconnect)
+12. Channel layout flexibility (5.1, 7.1 downmix, stereo passthrough)
+13. Proper latency reporting to PipeWire
+14. Distribution packaging
+15. Handle device hot-plug (S/PDIF cable connect/disconnect)
 
 ## Coding Style
 
 - C++, 4 spaces indentation, Allman brace style
 - 120 character line length, LF line endings
 - No trailing whitespace, single final newline
+- Prefer ranged-for loops (`for (auto&& x : range)`) over index-based loops wherever possible. Use `std::span`, `std::views::enumerate`, `std::views::zip`, etc. to make loops rangeable.
+- Avoid generic `int` for sizes/indices — use explicitly-sized types (`uint8_t`, `uint16_t`, `uint32_t`, `size_t`) to prevent implicit signed/unsigned conversions and unnecessary casts. Match the width to the domain (e.g. channel count fits in `uint8_t`, sample rate in `uint32_t`).
+- Prefer `std::array` over C arrays and raw pointers at function signature scope — avoids implicit array-to-pointer decay and useless span conversions.
+- **No heap allocations on the critical (real-time audio) path.** Avoid `std::vector`, `new`, `malloc`, `std::string`, or any allocating container in RT callbacks and encoding functions. Use `std::array`, fixed-size buffers, and pre-allocated storage. Tests are exempt — allocating containers are acceptable in test code.
 - See `.editorconfig` for editor integration
 
 ## Build & Test Commands
