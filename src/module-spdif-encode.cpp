@@ -257,8 +257,6 @@ static void ForceUnitVolume(pw_stream* stream)
     spa_pod_builder_array(&b, sizeof(float), SPA_TYPE_Float, OutputChannels, volumes);
     spa_pod_builder_prop(&b, SPA_PROP_softVolumes, 0);
     spa_pod_builder_array(&b, sizeof(float), SPA_TYPE_Float, OutputChannels, volumes);
-    spa_pod_builder_prop(&b, SPA_PROP_mute, 0);
-    spa_pod_builder_bool(&b, false);
     auto* param = static_cast<spa_pod*>(spa_pod_builder_pop(&b, &f));
 
     pw_stream_set_param(stream, SPA_PARAM_Props, param);
@@ -277,19 +275,6 @@ static bool HasNonUnitVolume(spa_pod_object const* obj, uint32_t key)
     return std::ranges::any_of(std::span(vols).first(n), [](float v) { return v != 1.0f; });
 }
 
-static bool HasMute(spa_pod_object const* obj)
-{
-    auto const* prop = spa_pod_object_find_prop(obj, nullptr, SPA_PROP_mute);
-    if (!prop)
-    {
-        return false;
-    }
-
-    bool muted = false;
-    spa_pod_get_bool(&prop->value, &muted);
-    return muted;
-}
-
 static void OnPlaybackParamChanged(void* userData, uint32_t id, spa_pod const* param)
 {
     if (id != SPA_PARAM_Props || !param)
@@ -300,10 +285,9 @@ static void OnPlaybackParamChanged(void* userData, uint32_t id, spa_pod const* p
     auto const* obj = reinterpret_cast<spa_pod_object const*>(param);
 
     if (HasNonUnitVolume(obj, SPA_PROP_channelVolumes)
-        || HasNonUnitVolume(obj, SPA_PROP_softVolumes)
-        || HasMute(obj))
+        || HasNonUnitVolume(obj, SPA_PROP_softVolumes))
     {
-        pw_log_warn("spdif-encode: volume/mute changed on output stream, "
+        pw_log_warn("spdif-encode: volume changed on output stream, "
                     "resetting to 1.0 (encoded bitstream cannot be volume-adjusted)");
         auto* data = static_cast<ModuleData*>(userData);
         ForceUnitVolume(data->m_PlaybackStream.get());

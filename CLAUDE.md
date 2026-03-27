@@ -134,6 +134,31 @@ Goal: select the virtual sink in pavucontrol, hear 5.1 audio encoded through S/P
 13. Proper latency reporting to PipeWire
 14. Distribution packaging
 15. Handle device hot-plug (S/PDIF cable connect/disconnect)
+16. **Stream suspension** — cork the playback stream when no clients are routing audio to the capture sink. Currently the module continuously encodes silence when idle, wasting CPU and keeping the HDMI/S/PDIF device active. Requires `state_changed` callbacks on the capture stream to detect idle/active transitions and cork/uncork the playback stream accordingly.
+
+## Known Issues & Limitations
+
+### No way to disable the module at runtime
+
+The module has no on/off switch once loaded. The mute button on the playback stream in pavucontrol works as a soft-disable (outputs S/PDIF silence), but there is no way to fully unload the module without editing the config and restarting PipeWire. A proper solution would require a SPA device/profile plugin so the encoded output appears as a device profile in pavucontrol's Configuration tab.
+
+### Mixing conflicts on shared HDMI/S/PDIF device
+
+If another PipeWire client targets the same HDMI output as the encoder, PipeWire's mixer will combine the IEC 61937-encoded bitstream with regular PCM, producing noise/garbage. This is a fundamental routing issue — encoded data cannot be mixed with anything. Workaround: ensure no other streams target the same hardware device, or use `node.exclusive` (untested, may cause other issues).
+
+### Latency breakdown
+
+End-to-end latency is higher than plain PCM output due to several unavoidable stages:
+
+| Stage | Latency | Notes |
+|-------|---------|-------|
+| AC3 frame accumulation | ~32ms | Must collect 1536 samples before encoding (inherent to AC3) |
+| PipeWire graph scheduling | ~1 quantum (10-21ms) | Depends on configured quantum size |
+| Output ring buffer | 0-32ms | Typically 1 burst; ring holds up to 4 as safety margin |
+| HDMI/S/PDIF transmitter | Hardware-dependent | Typically small |
+| AVR/soundbar AC3 decode | 20-50ms | Receiver-dependent, cannot be controlled |
+
+**Total module-controllable latency: ~32-64ms.** The rest comes from the PipeWire graph, hardware, and receiver. Measured end-to-end latency of ~350ms includes the full chain (MIDI→USB→synth→PipeWire→encode→HDMI→receiver→speakers), so the module adds roughly 32-64ms on top of what plain PCM output would add.
 
 ## Coding Style
 
