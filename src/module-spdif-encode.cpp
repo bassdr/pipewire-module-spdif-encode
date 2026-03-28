@@ -412,7 +412,7 @@ int pipewire__module_init(pw_impl_module* module, char const* args)
         PW_KEY_MEDIA_CATEGORY, "Playback",
         PW_KEY_MEDIA_CLASS, "Stream/Output/Audio",
         PW_KEY_NODE_DONT_RECONNECT, "true",
-        PW_KEY_NODE_LATENCY, std::format("512/{}", SampleRate).c_str(),
+        PW_KEY_NODE_LATENCY, std::format("{}/{}", Ac3Encoder::FrameSize, SampleRate).c_str(),
         PW_KEY_NODE_RATE, std::format("1/{}", SampleRate).c_str(),
         "stream.dont-remix", "true",
         "channelmix.disable", "true",
