@@ -9,25 +9,21 @@ IEC 61937-framed data to a hardware S/PDIF, TOSLINK, or HDMI device.
 The only existing solution for real-time surround encoding on Linux is the
 [ALSA a52 plugin](https://github.com/alsa-project/alsa-plugins). Under
 PipeWire, this plugin is accessed through multiple abstraction layers
-(PipeWire -> PulseAudio compat -> ALSA compat -> a52 plugin -> hardware),
+(PipeWire &rarr; PulseAudio compat &rarr; ALSA compat &rarr; a52 plugin &rarr; hardware),
 causing latency, buffer glitches, and audible artifacts. This module replaces
 all of that with a single native PipeWire module that talks directly to the
 hardware sink.
 
 ```
- Applications          pipewire-module-          ALSA IEC958
- (5.1 PCM)    ------> spdif-encode      ------> device (hw:X,Y)
-                       1. Receive F32P PCM       S/PDIF, TOSLINK,
-                       2. Buffer 1536 samples    or HDMI output
-                       3. Encode AC3
-                       4. IEC 61937 framing
-                       5. Output stereo S16LE
+Application (5.1 PCM) --> Virtual Sink ("S/PDIF Surround Encoder") --> AC3 encode --> HDMI/S/PDIF device
 ```
 
 ## Dependencies
 
 - `libpipewire-0.3` (>= 0.3.0)
 - `libavcodec` / `libavutil` (FFmpeg)
+- C++23 compiler (GCC 14+ or Clang 18+)
+- Meson build system
 - Optional: [Catch2](https://github.com/catchorg/Catch2) v3 (for tests)
 
 ## Building
@@ -37,72 +33,104 @@ meson setup build
 meson compile -C build
 ```
 
-To run tests:
+To run tests (requires Catch2 v3):
 
 ```bash
-meson setup build -Dtests=true
+meson setup build -Dtest=true
 meson compile -C build
 meson test -C build
 ```
 
 ## Installation
 
+Install the shared library to PipeWire's module directory:
+
 ```bash
 meson install -C build
 ```
 
-This installs the module to PipeWire's module directory (typically
-`/usr/lib64/pipewire-0.3/`).
+Or test without installing by setting the module search path:
+
+```bash
+PIPEWIRE_MODULE_DIR=build/src pipewire
+```
 
 ## Usage
 
-Copy `config/spdif-encode.conf` to your PipeWire config directory and restart
-PipeWire:
+1. Find your HDMI or S/PDIF device name:
+
+```bash
+pw-cli list-objects | grep -E "node.name.*alsa_output"
+# or
+pactl list sinks short
+```
+
+2. Copy the example config and set your device:
 
 ```bash
 cp config/spdif-encode.conf ~/.config/pipewire/pipewire.conf.d/
-systemctl --user restart pipewire
 ```
 
-The module creates a virtual sink called "S/PDIF Surround Encoder" that
-appears in your audio settings. Route any application's audio to this sink
-to have it encoded as AC3 and sent to your S/PDIF output.
-
-You can also load it manually at runtime:
-
-```bash
-pw-cli load-module libpipewire-module-spdif-encode
-```
-
-Verify it's running:
-
-```bash
-pw-cli list-objects | grep spdif
-```
-
-## Configuration
-
-The module accepts the following arguments in `spdif-encode.conf`:
+Edit `~/.config/pipewire/pipewire.conf.d/spdif-encode.conf`:
 
 ```
 context.modules = [
     {   name = libpipewire-module-spdif-encode
         args = {
-            # target.object = ""   # target S/PDIF device name
+            target.object = "alsa_output.pci-0000_01_00.1.hdmi-stereo"
         }
     }
 ]
 ```
 
-## Status
+3. Restart PipeWire:
 
-This project is in early development (Phase 1). Currently implemented:
+```bash
+systemctl --user restart pipewire
+```
 
-- AC3 encoding via libavcodec (fixed-point `ac3_fixed` preferred)
-- IEC 61937 framing
-- Dual-stream PipeWire module (virtual sink + hardware output)
-- Ring buffer for sample accumulation
-- Unit tests for encoder and IEC 61937 framing
+4. Select "S/PDIF Surround Encoder" as your output device in pavucontrol or
+   your desktop's audio settings. Any audio routed to this sink will be
+   AC3-encoded and sent to the target device.
+
+You can verify the module is loaded with:
+
+```bash
+pw-cli list-objects | grep spdif
+pactl list sinks short | grep spdif
+```
+
+## How it works
+
+The module uses PipeWire's dual-stream pattern (same as module-loopback):
+
+1. A **capture stream** appears as a virtual 5.1 surround sink that applications can route audio to
+2. A **playback stream** connects to the target HDMI/S/PDIF hardware device
+
+When audio arrives at the virtual sink:
+
+1. Incoming 5.1 float32 planar PCM is accumulated until a full AC3 frame (1536 samples) is available
+2. The frame is encoded to AC3 using libavcodec's fixed-point encoder (`ac3_fixed`)
+3. The encoded bitstream is wrapped in an IEC 61937 burst (6144 bytes)
+4. The burst is output as stereo S16LE to the hardware device
+
+The playback stream's volume is locked to 1.0 since any scaling would corrupt
+the encoded bitstream. The mute button works as expected (outputs silence).
+
+## Known limitations
+
+- **No runtime disable** -- the module cannot be unloaded without restarting PipeWire.
+  Use the mute button on the playback stream in pavucontrol as a soft-disable.
+
+- **Exclusive HDMI/S/PDIF use** -- if another application routes audio directly
+  to the same HDMI device, PipeWire will mix it with the encoded bitstream,
+  producing noise. Ensure only the encoder targets the hardware device.
+
+- **Latency** -- AC3 encoding adds ~32ms of frame accumulation latency.
+  The receiver (AVR/soundbar) adds its own AC3 decode latency (typically
+  100-150ms), which is outside this module's control.
+
+- **AC3 only** -- DTS encoding is not yet supported.
 
 ## License
 

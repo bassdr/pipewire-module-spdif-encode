@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-**pipewire-module-spdif-encode** is a native PipeWire module that creates a virtual surround sink, encodes multichannel PCM audio to AC3 (Dolby Digital) or DTS in real-time, and outputs IEC 61937-framed data to a hardware S/PDIF, TOSLINK, or HDMI device.
+**pipewire-module-spdif-encode** is a native PipeWire module that creates a virtual surround sink, encodes multichannel PCM audio to AC3 (Dolby Digital) in real-time, and outputs IEC 61937-framed data to a hardware S/PDIF, TOSLINK, or HDMI device.
 
 ### Why this exists
 
@@ -29,7 +29,7 @@ Ideally this would be a device profile in pavucontrol's Configuration tab (like 
 │              │     │                           │     │                 │
 │ Route to the │     │ 1. Receives 5.1 F32P PCM  │     │ Set via         │
 │ virtual sink │     │ 2. Buffers 1536 samples   │     │ target.object   │
-│ "S/PDIF      │     │ 3. Encodes AC3 or DTS     │     │ module arg      │
+│ "S/PDIF      │     │ 3. Encodes AC3            │     │ module arg      │
 │  Surround    │     │ 4. IEC 61937 framing      │     │                 │
 │  Encoder"    │     │ 5. Outputs stereo S16LE   │     │                 │
 └─────────────┘     └──────────────────────────┘     └─────────────────┘
@@ -49,18 +49,16 @@ The module creates two `pw_stream` objects:
 2. **Playback stream** (`PW_DIRECTION_OUTPUT`, `media.class = "Stream/Output/Audio"`)
    - Outputs stereo S16LE containing IEC 61937-wrapped encoded data
    - Connects to the hardware device specified by `target.object` module arg
-   - Marked `node.passive` and `node.dont-reconnect` to avoid appearing as a regular playback client
+   - Marked `node.dont-reconnect` to avoid appearing as a regular playback client
    - Uses `PW_STREAM_FLAG_TRIGGER` — only processes when capture triggers it
 
 ### Encoding pipeline
 
-1. Capture callback receives PCM, triggers playback
-2. Playback callback:
-   - Dequeues capture buffer (6-channel F32P)
-   - Converts F32P → S16P with SMPTE channel reorder (FL,FR,FC,LFE,RL,RR)
-   - Feeds 1536-sample frames to libavcodec AC3/DTS encoder
-   - Wraps encoded frame in IEC 61937 burst (8-byte header + payload + zero padding = 6144 bytes)
-   - Queues to playback output
+1. Capture callback receives F32P PCM (one `spa_data` per channel), accumulates samples in a residual buffer until a full 1536-sample AC3 frame is available
+2. F32P samples are converted directly into the libavcodec frame buffers (S16P, S32P, or FLTP depending on the codec variant)
+3. Encoded AC3 bitstream is wrapped in an IEC 61937 burst and pushed to the output ring buffer
+4. Capture triggers the playback stream, which drains the output ring into PipeWire's playback buffer
+5. Playback volume is locked to 1.0 (any scaling corrupts the bitstream); mute is allowed (outputs zeros)
 
 ### IEC 61937 burst format
 
@@ -93,13 +91,13 @@ Pd = payload_bytes * 8               (length in bits)
 pipewire-module-spdif-encode/
 ├── CLAUDE.md                          # This file
 ├── meson.build                        # Build system
-├── meson_options.txt                  # Build options (codec selection)
+├── meson_options.txt                  # Build options
 ├── src/
 │   ├── module-spdif-encode.cpp        # PipeWire module entry point, stream setup, processing
 │   ├── encoder.h                      # Codec-agnostic encoder interface
 │   ├── encoder-ac3.h                  # AC3 encoder header
 │   ├── encoder-ac3.cpp                # AC3 encoder (libavcodec ac3_fixed/ac3)
-│   └── iec61937.h                     # IEC 61937 framing (header-only, small enough)
+│   └── iec61937.h                     # IEC 61937 framing (header-only)
 ├── tests/
 │   ├── test-iec61937.cpp              # IEC 61937 framing tests (Catch2)
 │   └── test-encoder-ac3.cpp           # AC3 encoder tests (Catch2)
@@ -107,34 +105,32 @@ pipewire-module-spdif-encode/
     └── spdif-encode.conf              # Example PipeWire config to load the module
 ```
 
-## Implementation Plan
+## Roadmap
 
-### Phase 1: Minimal viable module (AC3 only)
+### DTS support
 
-1. **`meson.build`** — build system linking against `libpipewire-0.3` and `libavcodec`/`libavutil`
-2. **`src/iec61937.h`** — IEC 61937 framing functions (header-only)
-3. **`src/encoder.h`** — encoder interface struct (init, encode_frame, destroy, frame_size, burst_size)
-4. **`src/encoder-ac3.cpp`** — AC3 implementation using libavcodec
-5. **`src/module-spdif-encode.cpp`** — PipeWire module with dual-stream pattern
-6. **`config/spdif-encode.conf`** — working config file
+- **`src/encoder-dts.cpp`** — DTS encoder (libavcodec or libdcaenc)
+- **`meson_options.txt`** — options for enabling/disabling codecs
+- Module arg `codec=ac3|dts` to select at load time
 
-Goal: select the virtual sink in pavucontrol, hear 5.1 audio encoded through S/PDIF.
+### Stereo passthrough
 
-### Phase 2: DTS support
+When input is stereo, forward raw PCM to the hardware device instead of AC3-encoding it. This bypasses both the 32ms frame accumulation and the receiver's ~100-150ms AC3 decode latency. Challenges: PipeWire upmixes stereo to 5.1 before it reaches the capture sink, so detection must happen via port/stream metadata rather than signal analysis. Mode transitions (PCM ↔ encoded) cause receiver re-lock gaps.
 
-7. **`src/encoder-dts.cpp`** — DTS encoder (libavcodec or libdcaenc)
-8. **`meson_options.txt`** — options for enabling/disabling codecs
-9. Module arg `codec=ac3|dts` to select at load time (or auto-detect from hardware caps)
+### Stream suspension
 
-### Phase 3: Passthrough & polish
+Cork the playback stream when no clients are routing audio to the capture sink. Currently the module continuously encodes silence when idle, wasting CPU and keeping the HDMI/S/PDIF device active. Requires `state_changed` callbacks on the capture stream to detect idle/active transitions.
 
-10. **Encoded passthrough** — detect already-encoded AC3/DTS input and forward directly to IEC 61937 framing (skip re-encoding). Requires advertising encoded format support on the capture sink, runtime format detection, and AC3 sync-word validation.
-11. Bitrate configuration via module args
-12. Channel layout flexibility (5.1, 7.1 downmix, stereo passthrough)
-13. Proper latency reporting to PipeWire
-14. Distribution packaging
-15. Handle device hot-plug (S/PDIF cable connect/disconnect)
-16. **Stream suspension** — cork the playback stream when no clients are routing audio to the capture sink. Currently the module continuously encodes silence when idle, wasting CPU and keeping the HDMI/S/PDIF device active. Requires `state_changed` callbacks on the capture stream to detect idle/active transitions and cork/uncork the playback stream accordingly.
+### Additional improvements
+
+- Encoded passthrough — detect already-encoded AC3/DTS input and forward directly to IEC 61937 framing (skip re-encoding)
+- Bitrate configuration via module args
+- Channel layout flexibility (5.1, 7.1 downmix)
+- Handle device hot-plug (S/PDIF cable connect/disconnect)
+
+### SPA device plugin (long-term)
+
+Replace the dual-stream module with a proper SPA device/profile plugin. This would make the encoded output appear as an HDMI device profile in pavucontrol's Configuration tab, eliminating routing footguns (mixing conflicts, no runtime disable) and enabling proper format negotiation for stereo passthrough. Significantly more complex (~2000-5000 lines vs current ~480).
 
 ## Known Issues & Limitations
 
@@ -144,21 +140,21 @@ The module has no on/off switch once loaded. The mute button on the playback str
 
 ### Mixing conflicts on shared HDMI/S/PDIF device
 
-If another PipeWire client targets the same HDMI output as the encoder, PipeWire's mixer will combine the IEC 61937-encoded bitstream with regular PCM, producing noise/garbage. This is a fundamental routing issue — encoded data cannot be mixed with anything. Workaround: ensure no other streams target the same hardware device, or use `node.exclusive` (untested, may cause other issues).
+If another PipeWire client targets the same HDMI output as the encoder, PipeWire's mixer will combine the IEC 61937-encoded bitstream with regular PCM, producing noise/garbage. This is a fundamental routing issue — encoded data cannot be mixed with anything. Workaround: ensure no other streams target the same hardware device.
 
-### Latency breakdown
+### Latency
 
 End-to-end latency is higher than plain PCM output due to several unavoidable stages:
 
 | Stage | Latency | Notes |
 |-------|---------|-------|
 | AC3 frame accumulation | ~32ms | Must collect 1536 samples before encoding (inherent to AC3) |
-| PipeWire graph scheduling | ~1 quantum (10-21ms) | Depends on configured quantum size |
+| PipeWire graph scheduling | ~1 quantum (~32ms) | Quantum matches AC3 frame size |
 | Output ring buffer | 0-32ms | Typically 1 burst; ring holds up to 4 as safety margin |
 | HDMI/S/PDIF transmitter | Hardware-dependent | Typically small |
-| AVR/soundbar AC3 decode | 20-50ms | Receiver-dependent, cannot be controlled |
+| AVR/soundbar AC3 decode | 100-150ms | Receiver-dependent, cannot be controlled |
 
-**Total module-controllable latency: ~32-64ms.** The rest comes from the PipeWire graph, hardware, and receiver. Measured end-to-end latency of ~350ms includes the full chain (MIDI→USB→synth→PipeWire→encode→HDMI→receiver→speakers), so the module adds roughly 32-64ms on top of what plain PCM output would add.
+**Module-controllable latency: ~32-64ms.** Receiver AC3 decode dominates. Measured ~200ms overhead vs plain PCM in a full MIDI→USB→synth→PipeWire→encode→HDMI→SPDIF extractor→speakers chain, of which roughly half is receiver decode latency.
 
 ## Coding Style
 
@@ -177,9 +173,6 @@ End-to-end latency is higher than plain PCM output due to several unavoidable st
 # Build
 meson setup build
 meson compile -C build
-
-# Install (to PipeWire module dir)
-meson install -C build
 
 # Test without installing (set module search path)
 PIPEWIRE_MODULE_DIR=build/src pipewire  # or restart pipewire
@@ -205,13 +198,13 @@ pactl list sinks short | grep spdif
 ## Dependencies
 
 - `libpipewire-0.3` (headers + pkg-config)
-- `libavcodec` / `libavutil` from FFmpeg (for AC3/DTS encoding)
-- Optional: `libdcaenc` (alternative DTS encoder)
+- `libavcodec` / `libavutil` from FFmpeg (for AC3 encoding)
+- Optional: [Catch2](https://github.com/catchorg/Catch2) v3 (for tests)
 
 ## Technical Notes
 
-- **Channel order**: PipeWire uses FL,FR,FC,LFE,RL,RR. libavcodec expects SMPTE order (same). The ALSA a52 plugin remaps because ALSA's order differs, but PipeWire's `SPA_AUDIO_CHANNEL_*` positions already match SMPTE — verify this during implementation.
-- **Real-time safety**: `ac3_fixed` (fixed-point encoder) is preferred over `ac3` (float) because it's less likely to allocate memory. The encoding happens in the RT-flagged process callback — verify no allocations occur.
-- **Buffer accumulation**: PipeWire may deliver buffers smaller than 1536 samples. The module needs a ring buffer to accumulate a full AC3 frame before encoding. This is critical.
-- **Playback stream format**: The output MUST appear as stereo S16LE to the hardware. PipeWire should not try to "process" it as normal audio. Setting the right node properties and target device is important.
-- **IEC958 non-audio flag**: The hardware device needs `IEC958_AES0_NONAUDIO` set in the channel status bits so the S/PDIF transmitter marks it as compressed data. This may need to be done via ALSA controls or the correct device string.
+- **Channel order**: PipeWire uses FL,FR,FC,LFE,RL,RR which matches SMPTE/libavcodec order. No remapping needed (unlike the ALSA a52 plugin which must remap ALSA's channel order).
+- **Real-time safety**: `ac3_fixed` (fixed-point encoder) is preferred over `ac3` (float) because it avoids floating-point allocations. The encoding happens in the RT-flagged process callback.
+- **Buffer accumulation**: PipeWire may deliver quantums smaller than 1536 samples. A residual buffer accumulates F32P samples across quantums until a full AC3 frame is available.
+- **Playback stream format**: The output appears as stereo S16LE to the hardware. Properties like `stream.dont-remix` and `channelmix.disable` prevent PipeWire from processing the encoded bitstream as normal audio.
+- **IEC958 non-audio flag**: The hardware device ideally needs `IEC958_AES0_NONAUDIO` set in the channel status bits. Currently not set by the module — most receivers auto-detect based on IEC 61937 sync words.
