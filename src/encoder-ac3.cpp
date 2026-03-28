@@ -17,8 +17,14 @@ void AVPacketDeleter::operator()(AVPacket* p) const { av_packet_free(&p); }
 
 std::expected<Ac3Encoder, InitError> Ac3Encoder::Create(int channels, int sampleRate, int64_t bitrate)
 {
-    // Prefer fixed-point encoder for RT safety
-    AVCodec const* codec = avcodec_find_encoder_by_name("ac3_fixed");
+    // Prefer floating-point encoder for better audio quality (FLTP avoids
+    // the F32→S16 precision loss of ac3_fixed).  Fall back to ac3_fixed if
+    // the float variant is unavailable.
+    AVCodec const* codec = avcodec_find_encoder_by_name("ac3");
+    if (!codec)
+    {
+        codec = avcodec_find_encoder_by_name("ac3_fixed");
+    }
     if (!codec)
     {
         codec = avcodec_find_encoder(AV_CODEC_ID_AC3);
@@ -83,6 +89,11 @@ std::expected<Ac3Encoder, InitError> Ac3Encoder::Create(int channels, int sample
     }
 
     return enc;
+}
+
+char const* Ac3Encoder::CodecName() const
+{
+    return m_CodecCtx ? m_CodecCtx->codec->name : "none";
 }
 
 EncodeResult Ac3Encoder::EncodeFrame(std::array<float const*, InputChannels> channels, size_t offset, uint16_t sampleCount,

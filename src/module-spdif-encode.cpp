@@ -63,14 +63,26 @@ struct ModuleData
     size_t m_OutRingWritePos{};  // in bytes, always burst-aligned
     size_t m_OutRingReadPos{};   // in bytes
     size_t m_OutRingStored{};    // in bytes
+
+    bool m_PlaybackStreaming{};  // true when playback stream is in STREAMING state
 };
+
+static void FlushRing(ModuleData* data)
+{
+    data->m_OutRingWritePos = 0;
+    data->m_OutRingReadPos = 0;
+    data->m_OutRingStored = 0;
+    data->m_ResidualCount = 0;
+}
 
 // Push an encoded AC3 frame into the output ring as an IEC 61937 burst.
 static void PushBurst(ModuleData* data, uint32_t encodedSize)
 {
     if (data->m_OutRingStored + Ac3Encoder::BurstSize > ModuleData::OutRingBytes)
     {
-        // Output ring full — drop oldest burst
+        // Output ring full — drop oldest burst (32ms of audio lost)
+        pw_log_warn("spdif-encode: ring overflow, dropping burst (%zu/%zu bytes stored)",
+                    data->m_OutRingStored, ModuleData::OutRingBytes);
         data->m_OutRingReadPos = (data->m_OutRingReadPos + Ac3Encoder::BurstSize)
                                  % ModuleData::OutRingBytes;
         data->m_OutRingStored -= Ac3Encoder::BurstSize;
@@ -180,12 +192,15 @@ static void OnCaptureProcess(void* userData)
                   : silence.data();
     }
 
-    EncodeAvailable(data, channels, sampleCount);
+    // Only encode when the playback stream can actually drain the ring.
+    // When the hardware device is suspended the playback stream has no
+    // buffers, so encoding would just overflow the ring endlessly.
+    if (data->m_PlaybackStreaming)
+    {
+        EncodeAvailable(data, channels, sampleCount);
+    }
 
     pw_stream_queue_buffer(data->m_CaptureStream.get(), buf);
-
-    // Always trigger playback to drain the output ring
-    pw_stream_trigger_process(data->m_PlaybackStream.get());
 }
 
 static void OnPlaybackProcess(void* userData)
@@ -233,6 +248,11 @@ static void OnPlaybackProcess(void* userData)
     data->m_OutRingStored -= ringBytes;
 
     // Zero-fill remainder (IEC 61937 silence = zeros)
+    if (ringBytes == 0 && data->m_OutRingStored == 0)
+    {
+        pw_log_debug("spdif-encode: ring underrun, outputting silence (%u frames requested)",
+                     outFrames);
+    }
     std::ranges::fill(std::span(it, output.end()), uint8_t{0});
 
     static constexpr int32_t FrameBytes = sizeof(int16_t) * OutputChannels;
@@ -275,6 +295,26 @@ static bool HasNonUnitVolume(spa_pod_object const* obj, uint32_t key)
     return std::ranges::any_of(std::span(vols).first(n), [](float v) { return v != 1.0f; });
 }
 
+static void OnPlaybackStateChanged(void* userData, enum pw_stream_state,
+                                   enum pw_stream_state state, char const*)
+{
+    auto* data = static_cast<ModuleData*>(userData);
+    bool const streaming = (state == PW_STREAM_STATE_STREAMING);
+
+    if (streaming && !data->m_PlaybackStreaming)
+    {
+        // Flush stale data (silence bursts accumulated while device was suspended)
+        FlushRing(data);
+        pw_log_info("spdif-encode: playback streaming, ring flushed");
+    }
+    else if (!streaming && data->m_PlaybackStreaming)
+    {
+        pw_log_info("spdif-encode: playback stopped (state=%d)", state);
+    }
+
+    data->m_PlaybackStreaming = streaming;
+}
+
 static void OnPlaybackParamChanged(void* userData, uint32_t id, spa_pod const* param)
 {
     if (id != SPA_PARAM_Props || !param)
@@ -312,7 +352,7 @@ static pw_stream_events const CaptureStreamEvents = {
 static pw_stream_events const PlaybackStreamEvents = {
     .version = PW_VERSION_STREAM_EVENTS,
     .destroy = {},
-    .state_changed = {},
+    .state_changed = OnPlaybackStateChanged,
     .control_info = {},
     .io_changed = {},
     .param_changed = OnPlaybackParamChanged,
@@ -452,8 +492,7 @@ int pipewire__module_init(pw_impl_module* module, char const* args)
                       PW_ID_ANY,
                       static_cast<pw_stream_flags>(PW_STREAM_FLAG_AUTOCONNECT |
                                                    PW_STREAM_FLAG_MAP_BUFFERS |
-                                                   PW_STREAM_FLAG_RT_PROCESS |
-                                                   PW_STREAM_FLAG_TRIGGER),
+                                                   PW_STREAM_FLAG_RT_PROCESS),
                       playbackParams, 1);
 
     // Lock playback stream volume to 1.0 — any scaling corrupts the IEC 61937 bitstream
@@ -461,7 +500,8 @@ int pipewire__module_init(pw_impl_module* module, char const* args)
 
     pw_properties_free(moduleProps);
 
-    pw_log_info("spdif-encode: module loaded, AC3 encoder ready");
+    pw_log_info("spdif-encode: module loaded, codec=%s (ring: %zu bursts, %zu bytes)",
+                data->m_Enc->CodecName(), ModuleData::OutRingBursts, ModuleData::OutRingBytes);
 
     return 0;
 }

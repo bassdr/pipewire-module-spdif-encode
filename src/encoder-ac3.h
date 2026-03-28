@@ -34,6 +34,8 @@ struct Ac3Encoder
     EncodeResult EncodeFrame(std::array<float const*, InputChannels> channels, size_t offset, uint16_t sampleCount,
                              uint8_t* outputBuf, size_t outputBufSize);
 
+    char const* CodecName() const;
+
 private:
     UniqueAVCodecContext m_CodecCtx;
     UniqueAVFrame m_Frame;
