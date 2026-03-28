@@ -20,7 +20,9 @@ pipewire_moduledir = pipewire_dep.get_variable(pkgconfig : 'moduledir')
 # Encoder library (shared between module and tests)
 encoder_lib = static_library(
     'encoder',
+    'src/encoder-av.cpp',
     'src/encoder-ac3.cpp',
+    'src/encoder-dts.cpp',
     dependencies : [libavcodec_dep, libavutil_dep],
 )
 

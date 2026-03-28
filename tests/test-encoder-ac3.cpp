@@ -24,8 +24,6 @@ struct F32PBuffer
             ptr = arr.data();
         }
     }
-
-    std::array<float const*, Channels> const& data() { return ptrs; }
 };
 
 TEST_CASE("AC3 encoder constants are correct", "[ac3]")
@@ -39,6 +37,7 @@ TEST_CASE("AC3 encoder creates successfully", "[ac3]")
 {
     auto enc = Ac3Encoder::Create(Channels, 48000, 448000);
     REQUIRE(enc.has_value());
+    CHECK(enc->FrameSize() == Ac3Encoder::FrameSize);
 }
 
 TEST_CASE("AC3 encoder rejects too few samples", "[ac3]")
@@ -49,7 +48,7 @@ TEST_CASE("AC3 encoder rejects too few samples", "[ac3]")
     uint8_t outputBuf[6144];
     F32PBuffer<100> buf;
 
-    auto result = enc->EncodeFrame(buf.data(), 0, 100, outputBuf, sizeof(outputBuf));
+    auto result = enc->EncodeFrame(buf.ptrs.data(), Channels, 0, 100, outputBuf, sizeof(outputBuf));
     CHECK(!result.has_value());
     CHECK(result.error() == EncodeError::InsufficientSamples);
 }
@@ -62,7 +61,7 @@ TEST_CASE("AC3 encoder produces valid output from silence", "[ac3]")
     uint8_t outputBuf[6144];
     F32PBuffer<Ac3Encoder::FrameSize> buf;
 
-    auto result = enc->EncodeFrame(buf.data(), 0, Ac3Encoder::FrameSize,
+    auto result = enc->EncodeFrame(buf.ptrs.data(), Channels, 0, Ac3Encoder::FrameSize,
                                    outputBuf, sizeof(outputBuf));
 
     REQUIRE(result.has_value());
@@ -86,7 +85,7 @@ TEST_CASE("AC3 encoder produces output from non-silent input", "[ac3]")
     }
 
     uint8_t outputBuf[6144];
-    auto result = enc->EncodeFrame(buf.data(), 0, Ac3Encoder::FrameSize,
+    auto result = enc->EncodeFrame(buf.ptrs.data(), Channels, 0, Ac3Encoder::FrameSize,
                                    outputBuf, sizeof(outputBuf));
 
     REQUIRE(result.has_value());
@@ -104,7 +103,7 @@ TEST_CASE("AC3 encoder can encode multiple consecutive frames", "[ac3]")
 
     for (auto frame : std::views::iota(0, 10))
     {
-        auto result = enc->EncodeFrame(buf.data(), 0, Ac3Encoder::FrameSize,
+        auto result = enc->EncodeFrame(buf.ptrs.data(), Channels, 0, Ac3Encoder::FrameSize,
                                        outputBuf, sizeof(outputBuf));
         INFO("frame: " << frame);
         REQUIRE(result.has_value());
@@ -119,7 +118,7 @@ TEST_CASE("AC3 encoded output fits in IEC 61937 burst", "[ac3]")
     F32PBuffer<Ac3Encoder::FrameSize> buf(0.9f);
     uint8_t outputBuf[6144];
 
-    auto result = enc->EncodeFrame(buf.data(), 0, Ac3Encoder::FrameSize,
+    auto result = enc->EncodeFrame(buf.ptrs.data(), Channels, 0, Ac3Encoder::FrameSize,
                                    outputBuf, sizeof(outputBuf));
 
     REQUIRE(result.has_value());
@@ -137,7 +136,7 @@ TEST_CASE("AC3 encoder works with non-zero offset", "[ac3]")
     F32PBuffer<512 + Ac3Encoder::FrameSize> buf(0.5f);
     uint8_t outputBuf[6144];
 
-    auto result = enc->EncodeFrame(buf.data(), offset, Ac3Encoder::FrameSize,
+    auto result = enc->EncodeFrame(buf.ptrs.data(), Channels, offset, Ac3Encoder::FrameSize,
                                    outputBuf, sizeof(outputBuf));
 
     REQUIRE(result.has_value());

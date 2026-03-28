@@ -12,3 +12,18 @@ test_encoder_ac3 = executable(
     dependencies : [catch2_dep, libavcodec_dep, libavutil_dep],
 )
 test('encoder-ac3', test_encoder_ac3)
+
+test_encoder_dts = executable(
+    'test-encoder-dts',
+    'test-encoder-dts.cpp',
+    link_with : encoder_lib,
+    dependencies : [catch2_dep, libavcodec_dep, libavutil_dep],
+)
+test('encoder-dts', test_encoder_dts)
+
+executable(
+    'generate-dts-spdif',
+    'generate-dts-spdif.cpp',
+    link_with : encoder_lib,
+    dependencies : [libavcodec_dep, libavutil_dep],
+)

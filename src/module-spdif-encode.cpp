@@ -1,4 +1,5 @@
 #include "encoder-ac3.h"
+#include "encoder-dts.h"
 #include "iec61937.h"
 
 #include <algorithm>
@@ -10,6 +11,7 @@
 #include <optional>
 #include <ranges>
 #include <span>
+#include <string_view>
 
 extern "C"
 {
@@ -23,8 +25,13 @@ extern "C"
 
 static constexpr uint8_t OutputChannels = 2;
 static constexpr uint32_t SampleRate = 48000;
-static constexpr uint32_t DefaultBitrate = 448000;
 static constexpr uint32_t MaxQuantum = 8192;
+
+// Compile-time maximums across all supported codecs (AC3, DTS).
+// Used to size fixed arrays that must accommodate any codec at runtime.
+static constexpr uint16_t MaxFrameSize = Ac3Encoder::FrameSize;    // 1536
+static constexpr uint32_t MaxBurstSize = Ac3Encoder::BurstSize;    // 6144
+static constexpr uint8_t MaxInputChannels = Ac3Encoder::InputChannels; // 6
 
 struct PWStreamDeleter { void operator()(pw_stream* s) const { pw_stream_destroy(s); } };
 using UniquePWStream = std::unique_ptr<pw_stream, PWStreamDeleter>;
@@ -41,24 +48,29 @@ struct ModuleData
     spa_hook m_CaptureListener{};
     spa_hook m_PlaybackListener{};
 
-    std::optional<Ac3Encoder> m_Enc;
+    std::optional<AvEncoder> m_Enc;
+
+    // Codec parameters (set at init from the selected encoder's constants)
+    uint16_t m_FrameSize{};
+    uint32_t m_BurstSize{};
+    uint16_t m_DataType{};
+    uint8_t m_InputChannels{};
 
     // Residual buffer: holds leftover F32P samples between quantums that
-    // didn't fill a complete 1536-sample AC3 frame.  At most 1535 samples
-    // per channel can be pending.
-    static constexpr size_t MaxResidual = Ac3Encoder::FrameSize - 1;
-    std::array<std::array<float, MaxResidual>, Ac3Encoder::InputChannels> m_Residual{};
+    // didn't fill a complete encoder frame.
+    static constexpr size_t MaxResidual = MaxFrameSize - 1;
+    std::array<std::array<float, MaxResidual>, MaxInputChannels> m_Residual{};
     size_t m_ResidualCount{};  // per-channel sample count
 
-    // Encoding workspace — holds raw AC3 bitstream from encoder
-    std::array<uint8_t, Ac3Encoder::BurstSize> m_EncodeBuf{};
+    // Encoding workspace — holds raw bitstream from encoder
+    std::array<uint8_t, MaxBurstSize> m_EncodeBuf{};
 
     // Output ring buffer: stores IEC 61937 bursts as raw bytes.
-    // Each AC3 burst is exactly BurstSize (6144) bytes.  Ring holds 4 bursts.
+    // Sized for the largest burst (AC3 = 6144 bytes).  When a smaller codec
+    // is active (DTS = 2048), the ring effectively holds more bursts.
     // Write position is always burst-aligned so bursts never straddle the wrap.
-    static constexpr size_t BurstFrames = Ac3Encoder::BurstSize / (sizeof(int16_t) * OutputChannels);
     static constexpr size_t OutRingBursts = 4;
-    static constexpr size_t OutRingBytes = Ac3Encoder::BurstSize * OutRingBursts;
+    static constexpr size_t OutRingBytes = MaxBurstSize * OutRingBursts;
     std::array<uint8_t, OutRingBytes> m_OutRingBuf{};
     size_t m_OutRingWritePos{};  // in bytes, always burst-aligned
     size_t m_OutRingReadPos{};   // in bytes
@@ -75,52 +87,60 @@ static void FlushRing(ModuleData* data)
     data->m_ResidualCount = 0;
 }
 
-// Push an encoded AC3 frame into the output ring as an IEC 61937 burst.
+// Push an encoded frame into the output ring as an IEC 61937 burst.
 static void PushBurst(ModuleData* data, uint32_t encodedSize)
 {
-    if (data->m_OutRingStored + Ac3Encoder::BurstSize > ModuleData::OutRingBytes)
+    uint32_t const burstSize = data->m_BurstSize;
+
+    if (data->m_OutRingStored + burstSize > ModuleData::OutRingBytes)
     {
-        // Output ring full — drop oldest burst (32ms of audio lost)
+        // Output ring full — drop oldest burst
         pw_log_warn("spdif-encode: ring overflow, dropping burst (%zu/%zu bytes stored)",
                     data->m_OutRingStored, ModuleData::OutRingBytes);
-        data->m_OutRingReadPos = (data->m_OutRingReadPos + Ac3Encoder::BurstSize)
+        data->m_OutRingReadPos = (data->m_OutRingReadPos + burstSize)
                                  % ModuleData::OutRingBytes;
-        data->m_OutRingStored -= Ac3Encoder::BurstSize;
+        data->m_OutRingStored -= burstSize;
     }
 
-    if (!Iec61937::CreateBurst<Ac3Encoder::DataType>(
+    if (!Iec61937::CreateBurst(
+        data->m_DataType,
         {data->m_EncodeBuf.data(), encodedSize},
-        std::span<uint8_t, Ac3Encoder::BurstSize>(data->m_OutRingBuf.data() + data->m_OutRingWritePos, Ac3Encoder::BurstSize)))
+        std::span<uint8_t>(data->m_OutRingBuf.data() + data->m_OutRingWritePos, burstSize)))
     {
         return;
     }
-    data->m_OutRingWritePos = (data->m_OutRingWritePos + Ac3Encoder::BurstSize)
+    data->m_OutRingWritePos = (data->m_OutRingWritePos + burstSize)
                               % ModuleData::OutRingBytes;
-    data->m_OutRingStored += Ac3Encoder::BurstSize;
+    data->m_OutRingStored += burstSize;
 }
 
-// Encode all complete AC3 frames from the available sample data.
+// Encode all complete frames from the available sample data.
 // 'channels' points to per-channel float arrays; samples [offset, offset+newSamples)
 // are the new data from this quantum.
-static void EncodeAvailable(ModuleData* data, std::array<float const*, Ac3Encoder::InputChannels> channels, size_t newSamples)
+static void EncodeAvailable(ModuleData* data, std::array<float const*, MaxInputChannels>& channels, size_t newSamples)
 {
+    uint16_t const frameSize = data->m_FrameSize;
+    uint8_t const inputChannels = data->m_InputChannels;
     size_t available = data->m_ResidualCount + newSamples;
     size_t consumed = 0;  // new samples consumed so far
 
-    while (available >= static_cast<size_t>(Ac3Encoder::FrameSize))
+    while (available >= static_cast<size_t>(frameSize))
     {
-        std::array<float const*, Ac3Encoder::InputChannels> framePtrs;
+        std::array<float const*, MaxInputChannels> framePtrs;
         size_t frameOffset = 0;
 
         if (data->m_ResidualCount > 0)
         {
             // Composite frame: residual prefix + beginning of new data
             // Use thread_local to avoid stack allocation every iteration
-            thread_local std::array<std::array<float, Ac3Encoder::FrameSize>, Ac3Encoder::InputChannels> composite;
+            thread_local std::array<std::array<float, MaxFrameSize>, MaxInputChannels> composite;
 
-            size_t const needed = Ac3Encoder::FrameSize - data->m_ResidualCount;
+            size_t const needed = frameSize - data->m_ResidualCount;
             for (auto&& [comp, res, chPtr, fPtr] : std::views::zip(
-                     composite, data->m_Residual, channels, framePtrs))
+                     std::span(composite).first(inputChannels),
+                     std::span(data->m_Residual).first(inputChannels),
+                     std::span(channels).first(inputChannels),
+                     std::span(framePtrs).first(inputChannels)))
             {
                 std::memcpy(comp.data(), res.data(),
                             data->m_ResidualCount * sizeof(float));
@@ -129,28 +149,28 @@ static void EncodeAvailable(ModuleData* data, std::array<float const*, Ac3Encode
                 fPtr = comp.data();
             }
             consumed += needed;
-            available -= Ac3Encoder::FrameSize;
+            available -= frameSize;
             data->m_ResidualCount = 0;
         }
         else
         {
             // Encode directly from source pointers at the right offset
-            for (auto&& [fPtr, chPtr] : std::views::zip(framePtrs, channels))
+            for (auto&& [fPtr, chPtr] : std::views::zip(
+                     std::span(framePtrs).first(inputChannels),
+                     std::span(channels).first(inputChannels)))
             {
                 fPtr = chPtr;
             }
             frameOffset = consumed;
-            consumed += Ac3Encoder::FrameSize;
-            available -= Ac3Encoder::FrameSize;
+            consumed += frameSize;
+            available -= frameSize;
         }
 
         auto encodeResult = data->m_Enc->EncodeFrame(
-            framePtrs, frameOffset, Ac3Encoder::FrameSize,
+            framePtrs.data(), inputChannels, frameOffset, frameSize,
             data->m_EncodeBuf.data(), data->m_EncodeBuf.size());
         if (!encodeResult)
-        {
             continue;
-        }
 
         PushBurst(data, *encodeResult);
     }
@@ -159,7 +179,9 @@ static void EncodeAvailable(ModuleData* data, std::array<float const*, Ac3Encode
     size_t const newRemaining = newSamples - consumed;
     if (newRemaining > 0)
     {
-        for (auto&& [res, chPtr] : std::views::zip(data->m_Residual, channels))
+        for (auto&& [res, chPtr] : std::views::zip(
+                 std::span(data->m_Residual).first(inputChannels),
+                 std::span(channels).first(inputChannels)))
         {
             std::memcpy(res.data() + data->m_ResidualCount, chPtr + consumed,
                         newRemaining * sizeof(float));
@@ -183,8 +205,8 @@ static void OnCaptureProcess(void* userData)
     // Collect channel pointers (F32P = one spa_data per channel)
     static std::array<float, MaxQuantum> const silence{};
 
-    std::array<float const*, Ac3Encoder::InputChannels> channels;
-    for (auto&& [ch, ptr] : std::views::enumerate(channels))
+    std::array<float const*, MaxInputChannels> channels;
+    for (auto&& [ch, ptr] : std::views::enumerate(std::span(channels).first(data->m_InputChannels)))
     {
         auto idx = static_cast<uint32_t>(ch);
         ptr = (idx < spaBuf->n_datas && spaBuf->datas[idx].data)
@@ -388,22 +410,59 @@ int pipewire__module_init(pw_impl_module* module, char const* args)
     data->m_Module = module;
     data->m_Context = pw_impl_module_get_context(module);
 
-    auto enc = Ac3Encoder::Create(Ac3Encoder::InputChannels, SampleRate, DefaultBitrate);
-    if (!enc)
+    // Select codec from module args (default: ac3)
+    char const* codecArg = pw_properties_get(moduleProps, "codec");
+    std::string_view codec = codecArg ? codecArg : "ac3";
+
+    if (codec == "ac3")
     {
-        pw_log_error("spdif-encode: failed to initialize AC3 encoder");
+        auto enc = Ac3Encoder::Create(Ac3Encoder::InputChannels, SampleRate, Ac3Encoder::DefaultBitrate);
+        if (!enc)
+        {
+            pw_log_error("spdif-encode: failed to initialize AC3 encoder");
+            pw_properties_free(moduleProps);
+            delete data;
+            return -1;
+        }
+        data->m_Enc = std::move(*enc);
+        data->m_FrameSize = Ac3Encoder::FrameSize;
+        data->m_BurstSize = Ac3Encoder::BurstSize;
+        data->m_DataType = Ac3Encoder::DataType;
+        data->m_InputChannels = Ac3Encoder::InputChannels;
+    }
+    else if (codec == "dts")
+    {
+        auto enc = DtsEncoder::Create(DtsEncoder::InputChannels, SampleRate, DtsEncoder::DefaultBitrate);
+        if (!enc)
+        {
+            pw_log_error("spdif-encode: failed to initialize DTS encoder "
+                         "(requires FFmpeg built with libdcaenc)");
+            pw_properties_free(moduleProps);
+            delete data;
+            return -1;
+        }
+        data->m_Enc = std::move(*enc);
+        data->m_FrameSize = DtsEncoder::FrameSize;
+        data->m_BurstSize = DtsEncoder::BurstSize;
+        data->m_DataType = DtsEncoder::DataType;
+        data->m_InputChannels = DtsEncoder::InputChannels;
+    }
+    else
+    {
+        pw_log_error("spdif-encode: unknown codec '%s' (expected 'ac3' or 'dts')", codecArg);
         pw_properties_free(moduleProps);
         delete data;
         return -1;
     }
-    data->m_Enc = std::move(*enc);
 
     pw_impl_module_add_listener(module, &data->m_ModuleListener, &ModuleEvents, data);
 
     // Capture stream: virtual 5.1 sink
     auto* captureProps = pw_properties_new(
         PW_KEY_NODE_NAME, "spdif-encode-sink",
-        PW_KEY_NODE_DESCRIPTION, "S/PDIF Surround Encoder",
+        PW_KEY_NODE_DESCRIPTION, codec == "dts"
+            ? "S/PDIF Surround Encoder (DTS)"
+            : "S/PDIF Surround Encoder (AC3)",
         PW_KEY_MEDIA_CLASS, "Audio/Sink",
         PW_KEY_MEDIA_TYPE, "Audio",
         PW_KEY_MEDIA_CATEGORY, "Playback",
@@ -424,7 +483,7 @@ int pipewire__module_init(pw_impl_module* module, char const* args)
     spa_audio_info_raw captureInfo{};
     captureInfo.format = SPA_AUDIO_FORMAT_F32P;
     captureInfo.rate = SampleRate;
-    captureInfo.channels = Ac3Encoder::InputChannels;
+    captureInfo.channels = data->m_InputChannels;
     captureInfo.position[0] = SPA_AUDIO_CHANNEL_FL;
     captureInfo.position[1] = SPA_AUDIO_CHANNEL_FR;
     captureInfo.position[2] = SPA_AUDIO_CHANNEL_FC;
@@ -444,7 +503,7 @@ int pipewire__module_init(pw_impl_module* module, char const* args)
                       captureParams, 1);
 
     // Playback stream: stereo S16LE to hardware
-    // The output is IEC 61937-framed AC3 data disguised as plain stereo PCM.
+    // The output is IEC 61937-framed data disguised as plain stereo PCM.
     // We must prevent audioconvert from modifying the bitstream.
     auto* playbackProps = pw_properties_new(
         PW_KEY_NODE_NAME, "spdif-encode-output",
@@ -452,7 +511,11 @@ int pipewire__module_init(pw_impl_module* module, char const* args)
         PW_KEY_MEDIA_CATEGORY, "Playback",
         PW_KEY_MEDIA_CLASS, "Stream/Output/Audio",
         PW_KEY_NODE_DONT_RECONNECT, "true",
-        PW_KEY_NODE_LATENCY, std::format("{}/{}", Ac3Encoder::FrameSize, SampleRate).c_str(),
+        // Use the largest codec frame size (AC3 = 1536) as the quantum for all codecs.
+        // Smaller quantums (e.g. DTS burst = 512 frames) can fail to start on HDMI devices
+        // with large minimum ALSA periods.  1536 is the LCM of AC3 (1536) and DTS (512)
+        // burst frame sizes, so it maps to whole bursts for every codec.
+        PW_KEY_NODE_LATENCY, std::format("{}/{}", MaxFrameSize, SampleRate).c_str(),
         PW_KEY_NODE_RATE, std::format("1/{}", SampleRate).c_str(),
         "stream.dont-remix", "true",
         "channelmix.disable", "true",
@@ -500,8 +563,9 @@ int pipewire__module_init(pw_impl_module* module, char const* args)
 
     pw_properties_free(moduleProps);
 
-    pw_log_info("spdif-encode: module loaded, codec=%s (ring: %zu bursts, %zu bytes)",
-                data->m_Enc->CodecName(), ModuleData::OutRingBursts, ModuleData::OutRingBytes);
+    pw_log_info("spdif-encode: module loaded, codec=%s (frame=%u, burst=%u, ring=%zu bursts)",
+                data->m_Enc->CodecName(), data->m_FrameSize, data->m_BurstSize,
+                ModuleData::OutRingBytes / data->m_BurstSize);
 
     return 0;
 }

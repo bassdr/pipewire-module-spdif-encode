@@ -92,3 +92,47 @@ TEST_CASE("IEC 61937 burst size matches AC3 spec", "[iec61937]")
     // AC3: 6144 bytes = 1536 stereo S16LE samples
     CHECK(6144 == 1536 * 2 * sizeof(int16_t));
 }
+
+TEST_CASE("IEC 61937 burst size matches DTS Type I spec", "[iec61937]")
+{
+    // DTS Type I: 2048 bytes = 512 stereo S16LE samples
+    CHECK(2048 == 512 * 2 * sizeof(int16_t));
+}
+
+TEST_CASE("IEC 61937 runtime overload produces same result as template", "[iec61937]")
+{
+    std::array<uint8_t, 64> encoded{};
+    for (auto&& [i, b] : std::views::enumerate(encoded))
+    {
+        b = static_cast<uint8_t>(i);
+    }
+
+    // Template overload
+    std::array<uint8_t, 6144> burstTemplate;
+    REQUIRE(Iec61937::CreateBurst<0x01>(encoded, burstTemplate).has_value());
+
+    // Runtime overload
+    std::array<uint8_t, 6144> burstRuntime;
+    REQUIRE(Iec61937::CreateBurst(uint16_t{0x01},
+                                  std::span<uint8_t const>(encoded),
+                                  std::span<uint8_t>(burstRuntime)).has_value());
+
+    CHECK(burstTemplate == burstRuntime);
+}
+
+TEST_CASE("IEC 61937 runtime overload works with DTS burst size", "[iec61937]")
+{
+    std::array<uint8_t, 64> encoded{0xBB};
+    std::array<uint8_t, 2048> burst;
+
+    auto result = Iec61937::CreateBurst(uint16_t{0x0B},
+                                        std::span<uint8_t const>(encoded),
+                                        std::span<uint8_t>(burst));
+    REQUIRE(result.has_value());
+
+    auto* out16 = reinterpret_cast<uint16_t*>(burst.data());
+    CHECK(out16[0] == 0xF872);
+    CHECK(out16[1] == 0x4E1F);
+    CHECK(out16[2] == 0x0B);  // DTS data type
+    CHECK(out16[3] == 64 * 8);
+}

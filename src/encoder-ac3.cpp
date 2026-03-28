@@ -3,22 +3,12 @@
 extern "C"
 {
 #include <libavcodec/avcodec.h>
-#include <libavutil/channel_layout.h>
 }
 
-#include <algorithm>
-#include <cstring>
-#include <ranges>
-#include <span>
-
-void AVCodecContextDeleter::operator()(AVCodecContext* p) const { avcodec_free_context(&p); }
-void AVFrameDeleter::operator()(AVFrame* p) const { av_frame_free(&p); }
-void AVPacketDeleter::operator()(AVPacket* p) const { av_packet_free(&p); }
-
-std::expected<Ac3Encoder, InitError> Ac3Encoder::Create(int channels, int sampleRate, int64_t bitrate)
+std::expected<AvEncoder, InitError> Ac3Encoder::Create(int channels, int sampleRate, int64_t bitrate)
 {
     // Prefer floating-point encoder for better audio quality (FLTP avoids
-    // the F32→S16 precision loss of ac3_fixed).  Fall back to ac3_fixed if
+    // the F32->S16 precision loss of ac3_fixed).  Fall back to ac3_fixed if
     // the float variant is unavailable.
     AVCodec const* codec = avcodec_find_encoder_by_name("ac3");
     if (!codec)
@@ -34,135 +24,5 @@ std::expected<Ac3Encoder, InitError> Ac3Encoder::Create(int channels, int sample
         return std::unexpected(InitError::CodecNotFound);
     }
 
-    Ac3Encoder enc;
-
-    enc.m_CodecCtx.reset(avcodec_alloc_context3(codec));
-    if (!enc.m_CodecCtx)
-    {
-        return std::unexpected(InitError::ContextAllocFailed);
-    }
-
-    // Query the codec's preferred sample format
-    AVSampleFormat const* sampleFmts = nullptr;
-    int numFmts = 0;
-    int cfgRet = avcodec_get_supported_config(enc.m_CodecCtx.get(), codec,
-                                               AV_CODEC_CONFIG_SAMPLE_FORMAT,
-                                               0, reinterpret_cast<void const**>(&sampleFmts),
-                                               &numFmts);
-    if (cfgRet < 0 || numFmts == 0 || !sampleFmts)
-    {
-        return std::unexpected(InitError::ConfigQueryFailed);
-    }
-    enc.m_CodecCtx->sample_fmt = sampleFmts[0];
-    enc.m_CodecCtx->sample_rate = sampleRate;
-    enc.m_CodecCtx->bit_rate = bitrate;
-
-    AVChannelLayout layout{};
-    av_channel_layout_default(&layout, channels);
-    av_channel_layout_copy(&enc.m_CodecCtx->ch_layout, &layout);
-    av_channel_layout_uninit(&layout);
-
-    if (avcodec_open2(enc.m_CodecCtx.get(), codec, nullptr) < 0)
-    {
-        return std::unexpected(InitError::CodecOpenFailed);
-    }
-
-    enc.m_Frame.reset(av_frame_alloc());
-    if (!enc.m_Frame)
-    {
-        return std::unexpected(InitError::FrameAllocFailed);
-    }
-
-    enc.m_Frame->nb_samples = FrameSize;
-    enc.m_Frame->format = enc.m_CodecCtx->sample_fmt;
-    av_channel_layout_copy(&enc.m_Frame->ch_layout, &enc.m_CodecCtx->ch_layout);
-
-    if (av_frame_get_buffer(enc.m_Frame.get(), 0) < 0)
-    {
-        return std::unexpected(InitError::FrameBufferAllocFailed);
-    }
-
-    enc.m_Packet.reset(av_packet_alloc());
-    if (!enc.m_Packet)
-    {
-        return std::unexpected(InitError::PacketAllocFailed);
-    }
-
-    return enc;
-}
-
-char const* Ac3Encoder::CodecName() const
-{
-    return m_CodecCtx ? m_CodecCtx->codec->name : "none";
-}
-
-EncodeResult Ac3Encoder::EncodeFrame(std::array<float const*, InputChannels> channels, size_t offset, uint16_t sampleCount,
-                                     uint8_t* outputBuf, size_t outputBufSize)
-{
-    if (sampleCount < FrameSize)
-    {
-        return std::unexpected(EncodeError::InsufficientSamples);
-    }
-
-    auto const frameBufs = std::span{m_Frame->data, static_cast<size_t>(m_CodecCtx->ch_layout.nb_channels)};
-
-    // Convert F32P input directly into the codec's planar frame buffers.
-    // The frame is exclusively owned — av_frame_make_writable() is unnecessary.
-    switch (m_CodecCtx->sample_fmt)
-    {
-    case AV_SAMPLE_FMT_S16P:
-        for (auto&& [buf, chPtr] : std::views::zip(frameBufs, channels))
-        {
-            auto dst = std::span(reinterpret_cast<int16_t*>(buf), FrameSize);
-            auto src = std::span(chPtr + offset, FrameSize);
-            for (auto&& [d, s] : std::views::zip(dst, src))
-            {
-                d = static_cast<int16_t>(std::clamp(s, -1.0f, 1.0f) * 32767.0f);
-            }
-        }
-        break;
-    case AV_SAMPLE_FMT_S32P:
-        for (auto&& [buf, chPtr] : std::views::zip(frameBufs, channels))
-        {
-            auto dst = std::span(reinterpret_cast<int32_t*>(buf), FrameSize);
-            auto src = std::span(chPtr + offset, FrameSize);
-            for (auto&& [d, s] : std::views::zip(dst, src))
-            {
-                d = static_cast<int32_t>(std::clamp(s, -1.0f, 1.0f) * 2147483647.0f);
-            }
-        }
-        break;
-    case AV_SAMPLE_FMT_FLTP:
-        for (auto&& [buf, chPtr] : std::views::zip(frameBufs, channels))
-        {
-            std::memcpy(buf, chPtr + offset, FrameSize * sizeof(float));
-        }
-        break;
-    default:
-        break;
-    }
-
-    int ret = avcodec_send_frame(m_CodecCtx.get(), m_Frame.get());
-    if (ret < 0)
-    {
-        return std::unexpected(EncodeError::SendFrameFailed);
-    }
-
-    ret = avcodec_receive_packet(m_CodecCtx.get(), m_Packet.get());
-    if (ret < 0)
-    {
-        return std::unexpected(EncodeError::ReceivePacketFailed);
-    }
-
-    if (static_cast<size_t>(m_Packet->size) > outputBufSize)
-    {
-        av_packet_unref(m_Packet.get());
-        return std::unexpected(EncodeError::OutputBufferTooSmall);
-    }
-
-    uint32_t size = m_Packet->size;
-    std::memcpy(outputBuf, m_Packet->data, size);
-    av_packet_unref(m_Packet.get());
-
-    return size;
+    return AvEncoder::Init(codec, channels, sampleRate, bitrate, FrameSize);
 }
