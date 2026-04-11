@@ -76,7 +76,8 @@ struct ModuleData
     size_t m_OutRingReadPos{};   // in bytes
     size_t m_OutRingStored{};    // in bytes
 
-    bool m_PlaybackStreaming{};  // true when playback stream is in STREAMING state
+    bool m_PlaybackStreaming{};   // true when playback stream is in STREAMING state
+    bool m_PlaybackConnected{};   // true after first successful connection (locks dont-reconnect)
 };
 
 static void FlushRing(ModuleData* data)
@@ -327,6 +328,20 @@ static void OnPlaybackStateChanged(void* userData, enum pw_stream_state,
     {
         // Flush stale data (silence bursts accumulated while device was suspended)
         FlushRing(data);
+
+        if (!data->m_PlaybackConnected)
+        {
+            // Lock to this device — prevent WirePlumber from moving the stream
+            // to a different sink if the target disappears.  We defer this until
+            // the first successful connection so the initial autoconnect can wait
+            // for slow-to-enumerate devices (e.g. HDMI via nvidia).
+            spa_dict_item items[] = {{PW_KEY_NODE_DONT_RECONNECT, "true"}};
+            spa_dict dict = SPA_DICT_INIT(items, 1);
+            pw_stream_update_properties(data->m_PlaybackStream.get(), &dict);
+            data->m_PlaybackConnected = true;
+            pw_log_info("spdif-encode: playback connected, locked to target device");
+        }
+
         pw_log_info("spdif-encode: playback streaming, ring flushed");
     }
     else if (!streaming && data->m_PlaybackStreaming)
@@ -510,7 +525,6 @@ int pipewire__module_init(pw_impl_module* module, char const* args)
         PW_KEY_MEDIA_TYPE, "Audio",
         PW_KEY_MEDIA_CATEGORY, "Playback",
         PW_KEY_MEDIA_CLASS, "Stream/Output/Audio",
-        PW_KEY_NODE_DONT_RECONNECT, "true",
         // Use the largest codec frame size (AC3 = 1536) as the quantum for all codecs.
         // Smaller quantums (e.g. DTS burst = 512 frames) can fail to start on HDMI devices
         // with large minimum ALSA periods.  1536 is the LCM of AC3 (1536) and DTS (512)
