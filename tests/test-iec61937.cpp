@@ -70,10 +70,12 @@ TEST_CASE("IEC 61937 burst is zero-padded after payload", "[iec61937]")
     REQUIRE(Iec61937::CreateBurst<0x01>(encoded, burst).has_value());
 
     // After header (8 bytes) + payload (16 bytes) = byte 24 onwards should be zero
-    for (auto&& [i, b] : std::views::enumerate(std::span(burst).subspan(24)))
+    size_t i = 0;
+    for (uint8_t const& b : std::span(burst).subspan(24))
     {
         INFO("byte index: " << (i + 24));
         CHECK(b == 0);
+        ++i;
     }
 }
 
@@ -102,9 +104,11 @@ TEST_CASE("IEC 61937 burst size matches DTS Type I spec", "[iec61937]")
 TEST_CASE("IEC 61937 runtime overload produces same result as template", "[iec61937]")
 {
     std::array<uint8_t, 64> encoded{};
-    for (auto&& [i, b] : std::views::enumerate(encoded))
+    uint8_t i = 0;
+    for (uint8_t& b : encoded)
     {
-        b = static_cast<uint8_t>(i);
+        b = i;
+        ++i;
     }
 
     // Template overload

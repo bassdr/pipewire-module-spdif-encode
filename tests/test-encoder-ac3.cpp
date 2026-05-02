@@ -77,9 +77,11 @@ TEST_CASE("AC3 encoder produces output from non-silent input", "[ac3]")
     F32PBuffer<Ac3Encoder::FrameSize> buf;
     for (auto&& [arr, ptr] : std::views::zip(buf.ch, buf.ptrs))
     {
-        for (auto&& [i, sample] : std::views::enumerate(arr))
+        float i = 0.f;
+        for (auto&& sample : arr)
         {
-            sample = std::sin(static_cast<float>(i) * 0.1f) * 0.5f;
+            sample = std::sin(i) * 0.5f;
+            i += 0.1f;
         }
         ptr = arr.data();
     }

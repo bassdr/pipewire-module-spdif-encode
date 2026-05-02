@@ -207,12 +207,13 @@ static void OnCaptureProcess(void* userData)
     static std::array<float, MaxQuantum> const silence{};
 
     std::array<float const*, MaxInputChannels> channels;
-    for (auto&& [ch, ptr] : std::views::enumerate(std::span(channels).first(data->m_InputChannels)))
+    uint32_t idx = 0;
+    for (auto& ptr : std::span(channels).first(data->m_InputChannels))
     {
-        auto idx = static_cast<uint32_t>(ch);
         ptr = (idx < spaBuf->n_datas && spaBuf->datas[idx].data)
                   ? static_cast<float const*>(spaBuf->datas[idx].data)
                   : silence.data();
+        ++idx;
     }
 
     // Only encode when the playback stream can actually drain the ring.

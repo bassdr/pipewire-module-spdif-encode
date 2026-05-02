@@ -12,7 +12,7 @@ struct DtsEncoder
     static constexpr uint16_t FrameSize = 512;
     static constexpr uint32_t BurstSize = 2048;
     static constexpr uint16_t DataType = 0x0B;
-    static constexpr uint8_t InputChannels = 6;
+    static constexpr uint32_t InputChannels = 6;
     // DVD-standard DTS bitrate: rate * 503 / 16 = 1,509,000 at 48 kHz.
     // Must stay ≤ 1,509,750 so encoded frames fit in the IEC 61937
     // Type I burst (max payload 2013 bytes per the spdif transport spec).

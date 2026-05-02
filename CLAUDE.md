@@ -161,7 +161,10 @@ End-to-end latency is higher than plain PCM output due to several unavoidable st
 - C++, 4 spaces indentation, Allman brace style
 - 120 character line length, LF line endings
 - No trailing whitespace, single final newline
-- Prefer ranged-for loops (`for (auto&& x : range)`) over index-based loops wherever possible. Use `std::span`, `std::views::enumerate`, `std::views::zip`, etc. to make loops rangeable.
+- Prefer ranged-for loops (`for (auto&& x : range)`) over index-based loops wherever possible. Use `std::span`, `std::views::zip`, etc. to make loops rangeable.
+- Use latest C++ standard, but must be able to compile with both g++ and clang++, so use features understood by both
+- No `throw`, `try` or `catch`, exceptions are disabled at compile time
+- Avoid virtual functions whenever possible
 - Avoid generic `int` for sizes/indices — use explicitly-sized types (`uint8_t`, `uint16_t`, `uint32_t`, `size_t`) to prevent implicit signed/unsigned conversions and unnecessary casts. Match the width to the domain (e.g. channel count fits in `uint8_t`, sample rate in `uint32_t`).
 - Prefer `std::array` over C arrays and raw pointers at function signature scope — avoids implicit array-to-pointer decay and useless span conversions.
 - **No heap allocations on the critical (real-time audio) path.** Avoid `std::vector`, `new`, `malloc`, `std::string`, or any allocating container in RT callbacks and encoding functions. Use `std::array`, fixed-size buffers, and pre-allocated storage. Tests are exempt — allocating containers are acceptable in test code.

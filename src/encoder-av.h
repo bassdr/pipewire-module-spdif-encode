@@ -60,7 +60,7 @@ struct AvEncoder
     // 'channels' is an array of per-channel float pointers (at least inputChannels entries).
     // Reads FrameSize() samples starting at 'offset' from each channel.
     // 'sampleCount' is the number of available samples (must be >= FrameSize()).
-    EncodeResult EncodeFrame(float const* const* channels, uint8_t inputChannels,
+    EncodeResult EncodeFrame(float const* const* channels, uint32_t inputChannels,
                              size_t offset, uint16_t sampleCount,
                              uint8_t* outputBuf, size_t outputBufSize);
 

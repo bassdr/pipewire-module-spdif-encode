@@ -106,9 +106,11 @@ TEST_CASE("DTS encoder produces output from non-silent input", "[dts]")
     F32PBuffer<DtsEncoder::FrameSize> buf;
     for (auto&& [arr, ptr] : std::views::zip(buf.ch, buf.ptrs))
     {
-        for (auto&& [i, sample] : std::views::enumerate(arr))
+        float i = 0.f;
+        for (auto&& sample : arr)
         {
-            sample = std::sin(static_cast<float>(i) * 0.1f) * 0.5f;
+            sample = std::sin(i) * 0.5f;
+            i += 0.1f;
         }
         ptr = arr.data();
     }
@@ -236,9 +238,11 @@ TEST_CASE("DTS encoded frame size fits IEC 61937 burst with header", "[dts]")
         // Vary input to exercise different frame sizes
         for (auto&& arr : buf.ch)
         {
-            for (auto&& [i, sample] : std::views::enumerate(arr))
+            float i = 0.f;
+            for (auto&& sample : arr)
             {
-                sample = std::sin(static_cast<float>(i + frame * 37) * 0.1f) * 0.9f;
+                sample = std::sin(i + frame * 3.7f) * 0.9f;
+                i += 0.1f;
             }
         }
 

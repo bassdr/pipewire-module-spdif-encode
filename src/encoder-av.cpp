@@ -98,7 +98,7 @@ char const* AvEncoder::CodecName() const
     return m_CodecCtx ? m_CodecCtx->codec->name : "none";
 }
 
-EncodeResult AvEncoder::EncodeFrame(float const* const* channels, uint8_t inputChannels,
+EncodeResult AvEncoder::EncodeFrame(float const* const* channels, uint32_t inputChannels,
                                      size_t offset, uint16_t sampleCount,
                                      uint8_t* outputBuf, size_t outputBufSize)
 {
@@ -109,14 +109,16 @@ EncodeResult AvEncoder::EncodeFrame(float const* const* channels, uint8_t inputC
 
     // Convert F32P input directly into the codec's frame buffers.
     // The frame is exclusively owned — av_frame_make_writable() is unnecessary.
-    int const numChannels = std::min(static_cast<int>(inputChannels),
-                                     m_CodecCtx->ch_layout.nb_channels);
-    auto const frameBufs = std::span{m_Frame->data, static_cast<size_t>(numChannels)};
+    uint32_t const numChannels = m_CodecCtx->ch_layout.nb_channels > 0
+        ? std::min<uint32_t>(inputChannels, static_cast<uint32_t>(m_CodecCtx->ch_layout.nb_channels))
+        : inputChannels;
+    auto const frameBufs = std::span{m_Frame->data, numChannels};
+    auto const channelSpan = std::span{channels, inputChannels};
 
     switch (m_CodecCtx->sample_fmt)
     {
     case AV_SAMPLE_FMT_S16P:
-        for (auto&& [buf, chPtr] : std::views::zip(frameBufs, std::span{channels, inputChannels}))
+        for (auto&& [buf, chPtr] : std::views::zip(frameBufs, channelSpan))
         {
             auto dst = std::span(reinterpret_cast<int16_t*>(buf), m_FrameSize);
             auto src = std::span(chPtr + offset, m_FrameSize);
@@ -127,7 +129,7 @@ EncodeResult AvEncoder::EncodeFrame(float const* const* channels, uint8_t inputC
         }
         break;
     case AV_SAMPLE_FMT_S32P:
-        for (auto&& [buf, chPtr] : std::views::zip(frameBufs, std::span{channels, inputChannels}))
+        for (auto&& [buf, chPtr] : std::views::zip(frameBufs, channelSpan))
         {
             auto dst = std::span(reinterpret_cast<int32_t*>(buf), m_FrameSize);
             auto src = std::span(chPtr + offset, m_FrameSize);
@@ -142,9 +144,10 @@ EncodeResult AvEncoder::EncodeFrame(float const* const* channels, uint8_t inputC
         // Interleaved S32: all channels in data[0], samples interleaved.
         auto dst = std::span(reinterpret_cast<int32_t*>(m_Frame->data[0]),
                              static_cast<size_t>(m_FrameSize) * numChannels);
-        for (auto&& [i, frame] : dst | std::views::chunk(numChannels) | std::views::enumerate)
+        for (size_t i = 0; i < m_FrameSize; ++i)
         {
-            for (auto&& [d, chPtr] : std::views::zip(frame, std::span{channels, inputChannels}))
+            auto frame = dst.subspan(i * numChannels, numChannels);
+            for (auto&& [d, chPtr] : std::views::zip(frame, channelSpan))
             {
                 d = static_cast<int32_t>(std::clamp(chPtr[offset + i], -1.0f, 1.0f) * 2147483647.0f);
             }
